@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'">
+  <title>Clip Image Viewer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" title="Clip Image Viewer">
+      <div class="brand-mark">CV</div>
+      <span>Clip Image Viewer</span>
+    </div>
+    <div class="file-title" id="fileTitle">이미지를 열어주세요</div>
+    <div class="top-actions">
+      <button id="openFileBtn" title="파일 열기 (Ctrl+O)">파일 열기</button>
+      <button id="openFolderBtn" title="폴더 열기 (Ctrl+Shift+O)">폴더</button>
+      <button class="icon-button" id="pinBtn" title="항상 위">핀</button>
+      <button class="icon-button" id="infoBtn" title="정보 (I)">정보</button>
+      <button class="icon-button" id="settingsBtn" title="설정">설정</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section id="stage" class="stage" tabindex="0">
+      <div id="emptyState" class="empty-state">
+        <div class="empty-icon">CV</div>
+        <h1>빠른 이미지 보기</h1>
+        <p>이미지, RAW, CLIP/CMC, PSD 또는 ZIP/CBZ 파일을 여기에 끌어놓으세요.</p>
+        <div class="empty-actions">
+          <button id="emptyOpenFileBtn" class="primary">이미지 열기</button>
+          <button id="emptyOpenFolderBtn">폴더 열기</button>
+        </div>
+        <div class="format-note">일반 이미지 · RAW · JXR · BPG · AVIF/JXL · PSD · CLIP/CMC · ZIP/CBZ</div>
+      </div>
+
+      <div id="loading" class="loading hidden">
+        <div class="spinner"></div>
+        <span>이미지를 불러오는 중...</span>
+      </div>
+
+      <div id="imageLayer" class="image-layer hidden">
+        <img id="viewerImage" draggable="false" alt="">
+      </div>
+
+      <button id="prevOverlay" class="nav-overlay nav-left hidden" title="이전 이미지">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M13 4 7 10l6 6"></path>
+        </svg>
+      </button>
+      <button id="nextOverlay" class="nav-overlay nav-right hidden" title="다음 이미지">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true">
+          <path d="m7 4 6 6-6 6"></path>
+        </svg>
+      </button>
+      <div id="dropHint" class="drop-hint hidden">여기에 놓아 열기</div>
+      <div id="toast" class="toast hidden"></div>
+    </section>
+
+    <aside id="infoPanel" class="info-panel hidden">
+      <div class="panel-heading">
+        <strong>이미지 정보</strong>
+        <button id="closeInfoBtn" class="icon-button">닫기</button>
+      </div>
+      <dl id="infoList"></dl>
+      <div class="panel-actions">
+        <button id="revealBtn">탐색기에서 보기</button>
+        <button id="openOriginalBtn">기본 앱으로 열기</button>
+      </div>
+    </aside>
+  </main>
+
+  <section id="thumbnailPanel" class="thumbnail-panel hidden">
+    <div id="thumbnailStrip" class="thumbnail-strip"></div>
+  </section>
+
+  <footer class="bottombar">
+    <div class="status-left">
+      <button id="thumbBtn" class="icon-button" title="미리보기 목록 (T)">목록</button>
+      <span id="counter">0 / 0</span>
+    </div>
+    <div class="viewer-controls">
+      <button id="prevBtn" class="round-button" title="이전 (←)">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M13 4 7 10l6 6"></path>
+        </svg>
+      </button>
+      <button id="zoomOutBtn" title="축소 (-)">−</button>
+      <button id="fitBtn" title="창에 맞춤 (0)">맞춤</button>
+      <button id="actualBtn" title="100% (1)">1:1</button>
+      <span id="zoomLabel">100%</span>
+      <button id="zoomInBtn" title="확대 (+)">＋</button>
+      <button id="rotateLeftBtn" title="왼쪽 회전 (Shift+R)">↶</button>
+      <button id="rotateRightBtn" title="오른쪽 회전 (R)">↷</button>
+      <button id="flipBtn" title="좌우 반전 (F)">반전</button>
+      <button id="slideshowBtn" title="슬라이드쇼 (S)">재생</button>
+      <button id="fullscreenBtn" title="전체 화면 (Enter/F11)">전체</button>
+      <button id="nextBtn" class="round-button" title="다음 (→)">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true">
+          <path d="m7 4 6 6-6 6"></path>
+        </svg>
+      </button>
+    </div>
+    <div class="status-right">
+      <select id="cropModeSelect" class="crop-mode-select hidden" title="만화 페이지 표시 범위">
+        <option value="trim">재단선</option>
+        <option value="bleed">재단 여백</option>
+        <option value="full">전체</option>
+      </select>
+      <span id="dimensionLabel" class="dimension-label">-</span>
+    </div>
+  </footer>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-heading">
+        <div>
+          <h2>Clip Image Viewer 설정</h2>
+          <p>보기 방식과 파일 연결을 설정합니다.</p>
+        </div>
+        <button value="cancel" class="icon-button">닫기</button>
+      </div>
+
+      <section class="setting-section">
+        <h3>보기</h3>
+        <label class="setting-row">
+          <span>배경</span>
+          <select id="backgroundSelect">
+            <option value="dark">어둡게</option>
+            <option value="black">검정</option>
+            <option value="light">밝게</option>
+            <option value="checker">투명 격자</option>
+          </select>
+        </label>
+        <label class="setting-row">
+          <span>슬라이드 간격</span>
+          <select id="slideIntervalSelect">
+            <option value="2000">2초</option>
+            <option value="3000">3초</option>
+            <option value="5000">5초</option>
+            <option value="10000">10초</option>
+          </select>
+        </label>
+        <label class="setting-row checkbox-row">
+          <input type="checkbox" id="loopCheckbox" checked>
+          <span>목록 끝에서 처음으로 순환</span>
+        </label>
+      </section>
+
+      <section class="setting-section">
+        <div class="update-heading">
+          <div>
+            <h3>업데이트</h3>
+            <p class="help-text" id="updateStatus">업데이트 정보를 확인하는 중...</p>
+          </div>
+          <button type="button" id="checkUpdateBtn">업데이트 확인</button>
+        </div>
+        <progress id="updateProgress" class="hidden" max="100" value="0"></progress>
+        <button type="button" id="restartUpdateBtn" class="primary hidden">
+          재시작하여 업데이트
+        </button>
+      </section>
+
+      <section class="setting-section" id="associationSection">
+        <h3>파일 연결</h3>
+        <p class="help-text" id="associationHelp">Windows 보안 정책상 기본 앱 지정은 Windows 설정 화면에서 사용자가 직접 확인해야 합니다.</p>
+        <div id="associationControls" class="hidden">
+          <strong class="association-title">기본 연결</strong>
+          <p class="association-basic">JPG · JPEG · PNG · GIF · WebP · BMP</p>
+          <div class="association-heading">
+            <strong class="association-title">추가 연결</strong>
+            <div>
+              <button type="button" class="small-button" id="selectAllAssociationBtn">전체 선택</button>
+              <button type="button" class="small-button" id="clearOptionalAssociationBtn">선택 해제</button>
+            </div>
+          </div>
+          <div class="association-options" id="associationOptions"></div>
+          <div class="association-actions">
+            <button type="button" id="clearAssociationBtn">모든 연결 제거</button>
+            <button type="button" id="applyAssociationBtn">선택 항목 등록 후 기본 앱 설정 열기</button>
+          </div>
+        </div>
+      </section>
+      <div class="dialog-footer">
+        <button value="cancel" class="primary">완료</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

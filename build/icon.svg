@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#80b7ff"/>
+      <stop offset="1" stop-color="#4259cf"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#151922"/>
+  <rect x="54" y="54" width="404" height="404" rx="86" fill="url(#g)"/>
+  <path d="M128 325V187c0-33 20-53 53-53h150c33 0 53 20 53 53v138c0 33-20 53-53 53H181c-33 0-53-20-53-53Z" fill="#121722" opacity=".2"/>
+  <circle cx="324" cy="203" r="38" fill="#fff" opacity=".92"/>
+  <path d="m139 339 89-93 55 52 38-37 57 78H139Z" fill="#fff" opacity=".95"/>
+  <text x="256" y="439" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="54" font-weight="800" fill="#fff">CV</text>
+</svg>
