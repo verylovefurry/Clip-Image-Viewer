@@ -10,7 +10,7 @@ const version = packageJson.version;
 const names = [
   `Clip-Image-Viewer-Setup-${version}-x64.exe`,
   `Clip-Image-Viewer-Setup-${version}-x64.exe.blockmap`,
-  `Clip Image Viewer-${version}-windows-x64-portable.zip`,
+  `Clip-Image-Viewer-${version}-windows-x64-portable.zip`,
   "latest.yml",
 ];
 const lines = names.map((name) => {

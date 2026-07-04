@@ -25,7 +25,7 @@ async function run() {
     html_url: "https://example.test/release",
     assets: [
       {
-        name: "Clip Image Viewer-1.2.0-windows-x64-portable.zip",
+        name: "Clip-Image-Viewer-1.2.0-windows-x64-portable.zip",
         browser_download_url: "https://example.test/portable.zip",
       },
       {
@@ -39,7 +39,7 @@ async function run() {
   const release = await getLatestPortableRelease(async () => response);
   assert.deepStrictEqual(release, {
     version: "1.2.0",
-    assetName: "Clip Image Viewer-1.2.0-windows-x64-portable.zip",
+    assetName: "Clip-Image-Viewer-1.2.0-windows-x64-portable.zip",
     downloadUrl: "https://example.test/portable.zip",
     checksumUrl: "https://example.test/SHA256SUMS.txt",
     releaseUrl: "https://example.test/release",
@@ -59,7 +59,7 @@ async function run() {
       });
     }
     return new Response(
-      `${checksum}  Clip Image Viewer-1.2.0-windows-x64-portable.zip\n`,
+      `${checksum}  Clip-Image-Viewer-1.2.0-windows-x64-portable.zip\n`,
       { status: 200 },
     );
   };

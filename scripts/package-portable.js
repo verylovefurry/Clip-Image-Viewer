@@ -9,7 +9,7 @@ const outputDirectory = path.resolve(__dirname, "..", "..", "..", "outputs");
 const unpackedDirectory = path.join(outputDirectory, "win-unpacked");
 const artifactPath = path.join(
   outputDirectory,
-  `${packageJson.build.productName}-${packageJson.version}-windows-x64-portable.zip`,
+  `Clip-Image-Viewer-${packageJson.version}-windows-x64-portable.zip`,
 );
 
 if (!fs.existsSync(path.join(unpackedDirectory, "ClipImageViewer.exe"))) {
