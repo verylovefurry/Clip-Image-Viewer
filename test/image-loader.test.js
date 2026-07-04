@@ -155,12 +155,24 @@ async function run() {
   assert.equal(cropped.layerDocument.layers[0].opacity, 75);
   assert.equal(cropped.layerDocument.toggleSupported, true);
   assert.equal(cropped.layerDocument.thumbnailSupported, true);
+  assert.equal(
+    cropped.layerDocument.layers[0].previewAccuracy,
+    "원본 합성 문맥 래스터(정확)",
+  );
   const clipLayerThumbnail = await loadLayerThumbnail({
     kind: "file",
     path: clipPath,
     name: "sample.clip",
   }, "2");
   assert(clipLayerThumbnail.startsWith("data:image/png;base64,"));
+  const clipThumbnailPixel = await sharp(
+    Buffer.from(clipLayerThumbnail.split(",")[1], "base64"),
+  ).ensureAlpha().raw().toBuffer();
+  const clipThumbnailCenter = (29 * 58 + 29) * 4;
+  assert.deepEqual(
+    [...clipThumbnailPixel.subarray(clipThumbnailCenter, clipThumbnailCenter + 4)],
+    [70, 120, 230, 255],
+  );
   const hiddenClip = await renderLayeredImage({
     kind: "file",
     path: clipPath,
@@ -235,6 +247,10 @@ async function run() {
   assert.equal(loadedPsd.layerDocument.format, "PSD");
   assert.equal(loadedPsd.layerDocument.layers.length, 1);
   assert.equal(loadedPsd.layerDocument.thumbnailSupported, true);
+  assert.equal(
+    loadedPsd.layerDocument.layers[0].previewAccuracy,
+    "저장 레이어 래스터(정확)",
+  );
   assert.equal(await prepareLayeredImage({
     kind: "file",
     path: psdPath,

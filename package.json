@@ -1,6 +1,6 @@
 {
   "name": "clip-image-viewer",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Windows media viewer with CLIP STUDIO PAINT, RAW, modern image and video format support",
   "main": "src/main.js",
   "author": "verylovefurry",

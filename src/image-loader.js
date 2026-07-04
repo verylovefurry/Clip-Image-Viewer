@@ -915,16 +915,20 @@ function applyClipLayerAvailability(layerDocument, rasterSources, vectorSources)
           layer.type === "text" ||
           Boolean(layer.gradient);
         layer.previewAccuracy = layer.rasterAvailable
-          ? "저장 래스터(정확)"
-          : layer.vectorAvailable
-            ? "벡터 경로(근사)"
-            : layer.type === "text"
-              ? "텍스트 재구성(근사)"
-              : layer.type === "paper"
-                ? "용지 색상"
-                : layer.gradient
-                  ? "그레이디언트 재구성(근사)"
-                : "문서 문맥(근사)";
+          ? layer.visible && layer.effects?.length
+            ? "원본 합성 문맥 래스터(정확)"
+            : "저장 레이어 래스터(정확)"
+          : layer.visible && (layer.vectorAvailable || layer.type === "text")
+            ? "원본 합성 문맥 래스터(정확)"
+            : layer.vectorAvailable
+              ? "벡터 경로 재구성(근사)"
+            : layer.type === "paper"
+              ? "용지 색상"
+              : layer.gradient
+                ? "그레이디언트 재구성(근사)"
+                : layer.visible
+                  ? "원본 합성 문맥 래스터(정확)"
+                  : "레이어 메타데이터";
         available += 1;
         if (layer.toggleAvailable) toggleable += 1;
       }
@@ -938,7 +942,7 @@ function applyClipLayerAvailability(layerDocument, rasterSources, vectorSources)
   layerDocument.thumbnailSupported = available > 0;
   layerDocument.toggleSupported = toggleable > 0;
   layerDocument.note = toggleable
-    ? "저장된 래스터·벡터 경로·용지·텍스트는 빠르게 ON/OFF합니다. 톤·3D·CSP 효과는 문서 문맥 미리보기를 제공하며 CSP와 동일한 재합성은 지원하지 않습니다."
+    ? "레이어 목록은 원본 구조를 유지하며, CSP 전용 표현은 저장된 합성본에서 비파괴 문맥 래스터로 표시합니다. ON/OFF 재합성은 지원 데이터 범위에서 처리합니다."
     : "레이어 구조와 종류별 미리보기만 제공합니다. 이 파일에는 독립 합성 가능한 레이어 데이터가 없습니다.";
 }
 
@@ -1115,6 +1119,7 @@ function psdLayerTree(layers, parentId = "") {
   return (layers || []).map((layer, index) => {
     const id = parentId ? `${parentId}.${index}` : String(index);
     const children = psdLayerTree(layer.children, id);
+    const contextRaster = !layer.hidden && psdLayerNeedsContextRaster(layer);
     return {
       id,
       name: layer.name || (children.length ? "그룹" : "이름 없는 레이어"),
@@ -1126,6 +1131,11 @@ function psdLayerTree(layers, parentId = "") {
       clipping: Boolean(layer.clipping),
       mask: Boolean(layer.mask || layer.vectorMask),
       effects: effectNames(layer),
+      previewAccuracy: children.length
+        ? "레이어 그룹"
+        : contextRaster
+          ? "원본 합성 문맥 래스터(정확)"
+          : "저장 레이어 래스터(정확)",
       children,
     };
   }).reverse();
@@ -1178,7 +1188,7 @@ async function renderPsd(buffer, ext, item) {
 
   try {
     const document = await getPsdDocument(item, buffer);
-    return await renderAgPsdComposite(document.psd);
+    return await psdCompositeBuffer(document);
   } catch (agError) {
     try {
       return await renderWebtoonPsd(buffer);
@@ -1527,7 +1537,7 @@ async function clipMetadataThumbnail(layer, size, preview) {
        <text x="${size - 10}" y="13" text-anchor="middle" font-size="8"
          font-family="Segoe UI, sans-serif" font-weight="700" fill="#10151d">FX</text>`
     : "";
-  if (preview && !["paper", "text"].includes(layer.type)) {
+  if (preview && layer.visible && !["paper", "text"].includes(layer.type)) {
     const overlay = Buffer.from(`
       <svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">
         <rect width="${size}" height="${size}" fill="#111722" fill-opacity="0.3"/>
@@ -1569,6 +1579,113 @@ async function clipMetadataThumbnail(layer, size, preview) {
   return sharp(svg).png({ compressionLevel: 7 }).toBuffer();
 }
 
+function psdLayerNeedsContextRaster(layer) {
+  return Boolean(
+    !layer.imageData?.data ||
+    layer.text ||
+    layer.vectorMask ||
+    layer.placedLayer ||
+    layer.linkedFile ||
+    layer.adjustment ||
+    layer.clipping ||
+    (layer.effects && !layer.effects.disabled),
+  );
+}
+
+function psdCompositeBuffer(document) {
+  if (!document.composite) {
+    document.composite = renderAgPsdComposite(document.psd).catch((error) => {
+      document.composite = null;
+      throw error;
+    });
+  }
+  return document.composite;
+}
+
+function clipContextBounds(layer, vector) {
+  if (vector?.bounds) return vector.bounds;
+  const bounds = layer.textAttributes?.bounds;
+  if (Array.isArray(bounds) && bounds.length >= 4) {
+    return {
+      left: bounds[0],
+      top: bounds[1],
+      right: bounds[2],
+      bottom: bounds[3],
+    };
+  }
+  return null;
+}
+
+function psdContextBounds(layer) {
+  const left = numberOrZero(layer.left);
+  const top = numberOrZero(layer.top);
+  const right = Number.isFinite(layer.right)
+    ? layer.right
+    : left + numberOrZero(layer.imageData?.width);
+  const bottom = Number.isFinite(layer.bottom)
+    ? layer.bottom
+    : top + numberOrZero(layer.imageData?.height);
+  if (right <= left || bottom <= top) return null;
+  return { left, top, right, bottom };
+}
+
+async function contextRasterThumbnail(
+  composite,
+  size,
+  bounds = null,
+  coordinateWidth = 0,
+  coordinateHeight = 0,
+) {
+  const metadata = await sharp(composite).metadata();
+  const imageWidth = metadata.width || size;
+  const imageHeight = metadata.height || size;
+  let pipeline = sharp(composite);
+  if (
+    bounds &&
+    coordinateWidth > 0 &&
+    coordinateHeight > 0 &&
+    [bounds.left, bounds.top, bounds.right, bounds.bottom].every(Number.isFinite)
+  ) {
+    const scaleX = imageWidth / coordinateWidth;
+    const scaleY = imageHeight / coordinateHeight;
+    const left = bounds.left * scaleX;
+    const top = bounds.top * scaleY;
+    const right = bounds.right * scaleX;
+    const bottom = bounds.bottom * scaleY;
+    const contentWidth = Math.max(1, right - left);
+    const contentHeight = Math.max(1, bottom - top);
+    const side = Math.min(
+      Math.max(imageWidth, imageHeight),
+      Math.max(24, Math.max(contentWidth, contentHeight) * 1.4),
+    );
+    const cropWidth = Math.max(1, Math.min(imageWidth, Math.round(side)));
+    const cropHeight = Math.max(1, Math.min(imageHeight, Math.round(side)));
+    const centerX = (left + right) / 2;
+    const centerY = (top + bottom) / 2;
+    const cropLeft = Math.max(
+      0,
+      Math.min(imageWidth - cropWidth, Math.round(centerX - cropWidth / 2)),
+    );
+    const cropTop = Math.max(
+      0,
+      Math.min(imageHeight - cropHeight, Math.round(centerY - cropHeight / 2)),
+    );
+    pipeline = pipeline.extract({
+      left: cropLeft,
+      top: cropTop,
+      width: cropWidth,
+      height: cropHeight,
+    });
+  }
+  return pipeline
+    .resize(size, size, {
+      fit: "contain",
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png({ compressionLevel: 7 })
+    .toBuffer();
+}
+
 async function loadLayerThumbnail(item, id, size = 58) {
   const ext = extensionOf(item.kind === "archive-entry" ? item.entryName : item.path);
   if (ext !== ".psd" && !CLIP_EXTENSIONS.has(ext)) return null;
@@ -1591,8 +1708,14 @@ async function loadLayerThumbnail(item, id, size = 58) {
     const vector = !decoded && layer.vectorAvailable
       ? cachedClipVector(item, clip, layer)
       : null;
+    const contextRaster = layer.visible && Boolean(
+      vector ||
+      layer.type === "text" ||
+      layer.effects?.length ||
+      (!decoded && !layer.gradient && layer.type !== "paper"),
+    );
     let reconstructed = null;
-    if (!decoded && !vector && layer.gradient) {
+    if (!decoded && !vector && !contextRaster && layer.gradient) {
       const documentWidth = Math.max(1, clip.layerDocument.width);
       const documentHeight = Math.max(1, clip.layerDocument.height);
       const scale = Math.min(1, 320 / Math.max(documentWidth, documentHeight));
@@ -1604,7 +1727,15 @@ async function loadLayerThumbnail(item, id, size = 58) {
         Math.max(1, Math.round(documentHeight * scale)),
       );
     }
-    const thumbnail = decoded
+    const thumbnail = contextRaster
+      ? await contextRasterThumbnail(
+          clip.preview,
+          thumbnailSize,
+          clipContextBounds(layer, vector),
+          clip.layerDocument.nativeWidth,
+          clip.layerDocument.nativeHeight,
+        )
+      : decoded
       ? await sharp(decoded.data, {
           raw: { width: decoded.width, height: decoded.height, channels: 4 },
         })
@@ -1636,9 +1767,25 @@ async function loadLayerThumbnail(item, id, size = 58) {
     return dataUrl;
   }
 
-  const { psd } = await getPsdDocument(item);
+  const document = await getPsdDocument(item);
+  const { psd } = document;
   const layer = psdLayerById(psd, id);
   if (!layer || layer.children?.length) return null;
+  if (!layer.hidden && psdLayerNeedsContextRaster(layer)) {
+    const thumbnail = await contextRasterThumbnail(
+      await psdCompositeBuffer(document),
+      thumbnailSize,
+      psdContextBounds(layer),
+      psd.width,
+      psd.height,
+    );
+    const dataUrl = `data:image/png;base64,${thumbnail.toString("base64")}`;
+    layerThumbnailCache.set(cacheKey, dataUrl);
+    while (layerThumbnailCache.size > LAYER_THUMBNAIL_CACHE_LIMIT) {
+      layerThumbnailCache.delete(layerThumbnailCache.keys().next().value);
+    }
+    return dataUrl;
+  }
   const bytes = rgbaBytes(layer.imageData);
   if (!bytes) return null;
 
