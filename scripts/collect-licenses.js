@@ -141,6 +141,7 @@ write(
   `===== CDDL 1.0 =====\n\n${libRawCddl}`,
 );
 write("Clip-Image-Viewer-LICENSE.txt", read("LICENSE"));
+write("clip_to_psd-LICENSE.txt", read("third_party/clip_to_psd-LICENSE.txt"));
 write("THIRD_PARTY_NOTICES.md", read("THIRD_PARTY_NOTICES.md"));
 
 const packageCount = collectPackageLicenses();

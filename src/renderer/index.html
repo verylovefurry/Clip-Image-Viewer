@@ -19,6 +19,7 @@
       <button id="openFileBtn" title="파일 열기 (Ctrl+O)">파일 열기</button>
       <button id="openFolderBtn" title="폴더 열기 (Ctrl+Shift+O)">폴더</button>
       <button class="icon-button" id="pinBtn" title="항상 위">핀</button>
+      <button class="icon-button hidden" id="layerBtn" title="레이어 (L)">레이어</button>
       <button class="icon-button" id="infoBtn" title="정보 (I)">정보</button>
       <button class="icon-button" id="settingsBtn" title="설정">설정</button>
     </div>
@@ -140,6 +141,19 @@
         <button id="openOriginalBtn">기본 앱으로 열기</button>
       </div>
     </aside>
+
+    <aside id="layerPanel" class="layer-panel hidden">
+      <div class="panel-heading">
+        <strong>레이어</strong>
+        <button id="closeLayerBtn" class="icon-button">닫기</button>
+      </div>
+      <p id="layerHelp" class="layer-help"></p>
+      <div id="layerTree" class="layer-tree"></div>
+      <section id="layerDetails" class="layer-details hidden">
+        <strong id="layerDetailName"></strong>
+        <dl id="layerDetailList"></dl>
+      </section>
+    </aside>
   </main>
 
   <section id="thumbnailPanel" class="thumbnail-panel hidden">
@@ -233,7 +247,7 @@
         </button>
       </section>
 
-      <section class="setting-section" id="associationSection">
+      <section class="setting-section">
         <h3>파일 연결</h3>
         <p class="help-text" id="associationHelp">Windows 보안 정책상 기본 앱 지정은 Windows 설정 화면에서 사용자가 직접 확인해야 합니다.</p>
         <div id="associationControls" class="hidden">

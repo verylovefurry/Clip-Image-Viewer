@@ -28,6 +28,16 @@ const state = {
   fullscreen: false,
   thumbsVisible: false,
   infoVisible: false,
+  layersVisible: false,
+  layerDocument: null,
+  layerVisibility: {},
+  renderedLayerVisibility: {},
+  selectedLayerId: "",
+  layerRenderSequence: 0,
+  layerThumbnails: {},
+  layerThumbnailLoading: new Set(),
+  layerThumbnailSequence: 0,
+  layerPreparationStarted: false,
   runtime: null,
   update: null,
   videoControlsTimer: null,
@@ -63,6 +73,12 @@ const loading = $("loading");
 const toast = $("toast");
 let toastTimer;
 let loadSequence = 0;
+let openSequence = 0;
+let selectionSequence = 0;
+let cancelPendingVideoLoad = null;
+let videoClickTimer = null;
+let videoControlInteracting = false;
+let thumbnailRenderSequence = 0;
 const imageCache = new Map();
 
 function currentItem() {
@@ -91,6 +107,10 @@ function clearSubtitleTracks() {
 }
 
 function clearVideo() {
+  clearTimeout(videoClickTimer);
+  videoClickTimer = null;
+  cancelPendingVideoLoad?.();
+  cancelPendingVideoLoad = null;
   clearTimeout(state.videoControlsTimer);
   clearSubtitleTracks();
   video.pause();
@@ -114,6 +134,294 @@ function clearImage() {
   image.removeAttribute("src");
   image.classList.add("hidden");
   state.imageDataUrl = "";
+  clearLayerDocument();
+}
+
+function flattenLayers(layers, output = []) {
+  for (const layer of layers || []) {
+    output.push(layer);
+    flattenLayers(layer.children, output);
+  }
+  return output;
+}
+
+function clearLayerDocument() {
+  state.layerThumbnailSequence += 1;
+  state.layerDocument = null;
+  state.layerVisibility = {};
+  state.renderedLayerVisibility = {};
+  state.selectedLayerId = "";
+  state.layerThumbnails = {};
+  state.layerThumbnailLoading.clear();
+  state.layerPreparationStarted = false;
+  state.layersVisible = false;
+  $("layerPanel")?.classList.add("hidden");
+  $("layerBtn")?.classList.add("hidden");
+  $("layerBtn")?.classList.remove("active");
+}
+
+function setLayerDocument(document) {
+  state.layerThumbnailSequence += 1;
+  state.layerDocument = document || null;
+  state.layerVisibility = {};
+  state.selectedLayerId = "";
+  state.layerThumbnails = {};
+  state.layerThumbnailLoading.clear();
+  state.layerPreparationStarted = false;
+  if (!document?.layers?.length) {
+    clearLayerDocument();
+    return;
+  }
+  flattenLayers(document.layers).forEach((layer) => {
+    state.layerVisibility[layer.id] = layer.visible;
+  });
+  state.renderedLayerVisibility = { ...state.layerVisibility };
+  $("layerBtn").classList.remove("hidden");
+  renderLayerPanel();
+}
+
+function layerById(id) {
+  return flattenLayers(state.layerDocument?.layers).find((layer) => layer.id === id) || null;
+}
+
+function renderLayerDetails() {
+  const layer = layerById(state.selectedLayerId);
+  const panel = $("layerDetails");
+  panel.classList.toggle("hidden", !layer);
+  if (!layer) return;
+  $("layerDetailName").textContent = layer.name;
+  const values = [
+    ["종류", layer.typeLabel || (layer.type === "group" ? "그룹" : layer.type)],
+    ["합성", layer.blendModeLabel || layer.blendMode || "표준"],
+    ["불투명도", `${layer.opacity}%`],
+    ["클리핑", layer.clipping ? "있음" : "없음"],
+    ["마스크", layer.mask ? "있음" : "없음"],
+    ["효과", layer.effects?.length ? layer.effects.join(", ") : "없음"],
+    ["미리보기", layer.previewAccuracy || "레이어 데이터"],
+  ];
+  $("layerDetailList").innerHTML = values
+    .map(([key, value]) => `<dt>${key}</dt><dd>${escapeHtml(String(value))}</dd>`)
+    .join("");
+}
+
+function renderLayerPanel() {
+  const layerDocument = state.layerDocument;
+  if (!layerDocument) return;
+  $("layerHelp").textContent = layerDocument.note || "";
+  const tree = $("layerTree");
+  tree.innerHTML = "";
+  const append = (layers, depth = 0) => {
+    for (const layer of layers || []) {
+      const isGroup = layer.type === "group" || Boolean(layer.children?.length);
+      const element = document.createElement("div");
+      element.className = `layer-row ${isGroup ? "layer-group-row" : "layer-leaf-row"}${
+        state.selectedLayerId === layer.id ? " selected" : ""
+      }`;
+      element.style.setProperty("--layer-depth", String(depth));
+      element.dataset.layerId = layer.id;
+      element.dataset.layerType = layer.type;
+
+      const visibility = document.createElement("button");
+      visibility.type = "button";
+      visibility.className = `layer-visibility${
+        state.layerVisibility[layer.id] ? " active" : ""
+      }`;
+      const toggleAvailable = layerDocument.toggleSupported && layer.toggleAvailable !== false;
+      visibility.title = toggleAvailable
+        ? (state.layerVisibility[layer.id] ? "레이어 숨기기" : "레이어 표시")
+        : "CSP 전용 렌더러가 필요한 레이어입니다.";
+      visibility.disabled = !toggleAvailable;
+      visibility.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void toggleLayerVisibility(layer.id);
+      });
+
+      const visual = document.createElement("span");
+      if (isGroup) {
+        visual.className = "layer-folder-icon";
+        visual.setAttribute("aria-hidden", "true");
+      } else if (
+        layerDocument.thumbnailSupported &&
+        layer.thumbnailAvailable !== false
+      ) {
+        visual.className = "layer-thumb-frame";
+        const thumbnail = document.createElement("img");
+        thumbnail.className = "layer-thumbnail";
+        thumbnail.dataset.layerId = layer.id;
+        thumbnail.alt = "";
+        thumbnail.decoding = "async";
+        if (state.layerThumbnails[layer.id]) {
+          thumbnail.src = state.layerThumbnails[layer.id];
+        }
+        visual.appendChild(thumbnail);
+      } else {
+        visual.className = "layer-placeholder-icon";
+        visual.setAttribute("aria-hidden", "true");
+      }
+
+      const name = document.createElement("button");
+      name.type = "button";
+      name.className = "layer-name";
+      name.innerHTML = `
+        <span class="layer-title">${escapeHtml(layer.name)}</span>
+        <span class="layer-meta">${layer.opacity}% · ${
+          escapeHtml(layer.blendModeLabel || layer.blendMode || "표준")
+        }</span>
+      `;
+      name.addEventListener("click", () => selectLayer(layer.id));
+
+      element.append(visibility, visual, name);
+      tree.appendChild(element);
+      append(layer.children, depth + 1);
+    }
+  };
+  append(layerDocument.layers);
+  renderLayerDetails();
+  if (state.layersVisible) void ensureLayerThumbnails();
+}
+
+async function ensureLayerThumbnails() {
+  const layerDocument = state.layerDocument;
+  if (!layerDocument?.thumbnailSupported) return;
+  const sequence = state.layerThumbnailSequence;
+  const item = currentItem();
+  if (!item) return;
+  const queue = flattenLayers(layerDocument.layers).filter((layer) => (
+    layer.type !== "group" &&
+    !layer.children?.length &&
+    layer.thumbnailAvailable !== false &&
+    !Object.prototype.hasOwnProperty.call(state.layerThumbnails, layer.id) &&
+    !state.layerThumbnailLoading.has(layer.id)
+  ));
+  if (!queue.length) return;
+  queue.forEach((layer) => state.layerThumbnailLoading.add(layer.id));
+
+  const loadNext = async () => {
+    while (queue.length && sequence === state.layerThumbnailSequence) {
+      const layer = queue.shift();
+      try {
+        const dataUrl = await window.clipView.loadLayerThumbnail(item, layer.id);
+        if (sequence !== state.layerThumbnailSequence) continue;
+        state.layerThumbnails[layer.id] = dataUrl || "";
+        if (!dataUrl) continue;
+        const thumbnail = document.querySelector(
+          `.layer-thumbnail[data-layer-id="${CSS.escape(layer.id)}"]`,
+        );
+        if (thumbnail) thumbnail.src = dataUrl;
+      } catch {
+        // A missing or unsupported layer preview does not block the layer panel.
+        if (sequence === state.layerThumbnailSequence) {
+          state.layerThumbnails[layer.id] = "";
+        }
+      } finally {
+        if (sequence === state.layerThumbnailSequence) {
+          state.layerThumbnailLoading.delete(layer.id);
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, queue.length) }, loadNext));
+}
+
+function selectLayer(id) {
+  state.selectedLayerId = id;
+  renderLayerPanel();
+  document.querySelector(`.layer-row[data-layer-id="${CSS.escape(id)}"]`)
+    ?.scrollIntoView({ block: "nearest" });
+}
+
+async function toggleLayerVisibility(id) {
+  const layer = layerById(id);
+  if (!state.layerDocument?.toggleSupported || layer?.toggleAvailable === false) return;
+  state.layerVisibility[id] = !state.layerVisibility[id];
+  renderLayerPanel();
+  const sequence = ++state.layerRenderSequence;
+  const loadingTimer = setTimeout(() => {
+    if (sequence === state.layerRenderSequence) loading.classList.remove("hidden");
+  }, 150);
+  try {
+    const result = await window.clipView.renderLayeredImage(
+      currentItem(),
+      state.layerVisibility,
+    );
+    if (sequence !== state.layerRenderSequence) return;
+    await decodeImage(result.dataUrl);
+    state.imageDataUrl = result.dataUrl;
+    state.metadata = result.metadata;
+    image.src = result.dataUrl;
+    await image.decode();
+    if (sequence !== state.layerRenderSequence) return;
+    state.naturalWidth = image.naturalWidth;
+    state.naturalHeight = image.naturalHeight;
+    state.renderedLayerVisibility = { ...state.layerVisibility };
+    if (state.fitMode) fitImage();
+    else applyTransform();
+    updateUi();
+  } catch (error) {
+    if (sequence === state.layerRenderSequence) {
+      state.layerVisibility = { ...state.renderedLayerVisibility };
+      renderLayerPanel();
+      showToast(error?.message || "레이어 표시를 변경하지 못했습니다.", true);
+    }
+  } finally {
+    clearTimeout(loadingTimer);
+    if (sequence === state.layerRenderSequence) loading.classList.add("hidden");
+  }
+}
+
+function toggleLayers(force) {
+  if (!state.layerDocument) return;
+  state.layersVisible = force ?? !state.layersVisible;
+  $("layerPanel").classList.toggle("hidden", !state.layersVisible);
+  $("layerBtn").classList.toggle("active", state.layersVisible);
+  if (state.layersVisible && state.infoVisible) toggleInfo(false);
+  if (state.layersVisible) {
+    void ensureLayerThumbnails();
+    if (!state.layerPreparationStarted) {
+      state.layerPreparationStarted = true;
+      const item = currentItem();
+      setTimeout(() => {
+        if (item) void window.clipView.prepareLayeredImage(item).catch(() => {});
+      }, 150);
+    }
+  }
+  setTimeout(() => state.fitMode && fitImage(), 0);
+}
+
+function imagePointFromEvent(event) {
+  if (!state.naturalWidth || !state.naturalHeight || !state.zoom) return null;
+  const rect = stage.getBoundingClientRect();
+  let x = event.clientX - (rect.left + rect.width / 2 + state.panX);
+  let y = event.clientY - (rect.top + rect.height / 2 + state.panY);
+  const angle = -state.rotation * Math.PI / 180;
+  const rotatedX = x * Math.cos(angle) - y * Math.sin(angle);
+  const rotatedY = x * Math.sin(angle) + y * Math.cos(angle);
+  x = rotatedX / (state.zoom * state.flipX) + state.naturalWidth / 2;
+  y = rotatedY / state.zoom + state.naturalHeight / 2;
+  if (x < 0 || y < 0 || x >= state.naturalWidth || y >= state.naturalHeight) return null;
+  return { x, y };
+}
+
+async function pickLayerAt(event) {
+  if (!state.layerDocument?.pickSupported) return;
+  const point = imagePointFromEvent(event);
+  if (!point) return;
+  try {
+    const id = await window.clipView.pickLayer(
+      currentItem(),
+      point.x,
+      point.y,
+      state.layerVisibility,
+    );
+    if (!id) {
+      showToast("해당 위치에서 레이어를 찾지 못했습니다.");
+      return;
+    }
+    if (!state.layersVisible) toggleLayers(true);
+    selectLayer(id);
+  } catch (error) {
+    showToast(error?.message || "레이어를 선택하지 못했습니다.", true);
+  }
 }
 
 function hideVideoContextMenu() {
@@ -128,6 +436,11 @@ function setVideoControlsMode(mode) {
 
 function hideVideoControls() {
   if (state.mediaType !== "video") return;
+  if (videoControlInteracting) {
+    clearTimeout(state.videoControlsTimer);
+    state.videoControlsTimer = setTimeout(hideVideoControls, 500);
+    return;
+  }
   videoControls.classList.add("controls-hidden");
   state.videoControlsLockedMode = "";
   document.body.classList.toggle("video-cursor-hidden", !video.paused);
@@ -540,6 +853,7 @@ function updateInfoPanel() {
     ["경로", item?.displayPath || item?.path || "-"],
     ["크기", `${meta.width || 0} × ${meta.height || 0}`],
     ["형식", meta.format || "-"],
+    ["브라우저 호환", meta.browserSupport || "-"],
     ["파일 용량", formatBytes(meta.byteSize)],
     ["재생 시간", formatDuration(meta.duration)],
     ["자막", meta.subtitleCount ? `${meta.subtitleCount}개` : "없음"],
@@ -607,10 +921,12 @@ async function loadCurrent() {
 
 async function loadCurrentImage(item) {
   const sequence = ++loadSequence;
+  state.layerRenderSequence += 1;
   const cached = imageCache.has(imageKey(state.index));
   loading.classList.toggle("hidden", cached);
   emptyState.classList.add("hidden");
   clearVideo();
+  clearLayerDocument();
   video.classList.add("hidden");
   state.mediaType = "image";
   if (!state.imageDataUrl) imageLayer.classList.add("hidden");
@@ -620,17 +936,15 @@ async function loadCurrentImage(item) {
     if (sequence !== loadSequence) return;
     state.imageDataUrl = result.dataUrl;
     state.metadata = result.metadata;
+    setLayerDocument(result.layerDocument);
     state.rotation = 0;
     state.flipX = 1;
     state.panX = 0;
     state.panY = 0;
     state.fitMode = true;
 
-    await new Promise((resolve, reject) => {
-      image.onload = resolve;
-      image.onerror = reject;
-      image.src = result.dataUrl;
-    });
+    image.src = result.dataUrl;
+    await image.decode();
     if (sequence !== loadSequence) return;
     state.naturalWidth = image.naturalWidth;
     state.naturalHeight = image.naturalHeight;
@@ -640,14 +954,23 @@ async function loadCurrentImage(item) {
     fitImage();
     updateUi();
     preloadAdjacentImages();
+    if (state.layerDocument?.toggleSupported) {
+      state.layerPreparationStarted = true;
+      setTimeout(() => {
+        if (sequence === loadSequence && currentItem() === item) {
+          void window.clipView.prepareLayeredImage(item).catch(() => {});
+        }
+      }, 100);
+    }
   } catch (error) {
+    if (sequence !== loadSequence) return;
     state.imageDataUrl = "";
     state.mediaType = "";
     imageLayer.classList.add("hidden");
     emptyState.classList.remove("hidden");
     showToast(error?.message || "이미지를 열지 못했습니다.", true);
   } finally {
-    loading.classList.add("hidden");
+    if (sequence === loadSequence) loading.classList.add("hidden");
   }
 }
 
@@ -666,6 +989,7 @@ async function loadCurrentVideo(item) {
       window.clipView.findSubtitles(item).catch(() => []),
     ]);
     if (sequence !== loadSequence) return;
+    const browserSupport = media.mime ? video.canPlayType(media.mime) : "";
 
     state.rotation = 0;
     state.flipX = 1;
@@ -674,8 +998,29 @@ async function loadCurrentVideo(item) {
     state.fitMode = true;
 
     await new Promise((resolve, reject) => {
-      video.onloadedmetadata = resolve;
-      video.onerror = () => reject(new Error("동영상 코덱을 재생할 수 없습니다."));
+      const cleanup = () => {
+        video.removeEventListener("loadedmetadata", handleLoaded);
+        video.removeEventListener("error", handleError);
+        cancelPendingVideoLoad = null;
+      };
+      const handleLoaded = () => {
+        cleanup();
+        resolve();
+      };
+      const handleError = () => {
+        cleanup();
+        reject(new Error(
+          browserSupport
+            ? "동영상 파일 또는 코덱을 재생할 수 없습니다."
+            : "Electron이 이 동영상 컨테이너 또는 코덱을 지원하지 않습니다.",
+        ));
+      };
+      cancelPendingVideoLoad = () => {
+        cleanup();
+        reject(new Error("동영상 불러오기가 취소되었습니다."));
+      };
+      video.addEventListener("loadedmetadata", handleLoaded, { once: true });
+      video.addEventListener("error", handleError, { once: true });
       video.controls = false;
       video.src = media.url;
       video.load();
@@ -693,6 +1038,7 @@ async function loadCurrentVideo(item) {
       height: state.naturalHeight,
       duration: video.duration,
       subtitleCount: subtitles.length,
+      browserSupport: browserSupport || "확인되지 않음",
     };
     attachSubtitleTracks(subtitles);
     video.classList.remove("hidden");
@@ -704,6 +1050,7 @@ async function loadCurrentVideo(item) {
     updateUi();
     preloadAdjacentImages();
   } catch (error) {
+    if (sequence !== loadSequence) return;
     state.videoSrc = "";
     state.mediaType = "";
     state.metadata = null;
@@ -713,40 +1060,49 @@ async function loadCurrentVideo(item) {
     emptyState.classList.remove("hidden");
     showToast(error?.message || "동영상을 열지 못했습니다.", true);
   } finally {
-    loading.classList.add("hidden");
+    if (sequence === loadSequence) loading.classList.add("hidden");
   }
 }
 
 async function openPath(targetPath) {
   if (!targetPath) return;
+  const sequence = ++openSequence;
   stopSlideshow();
   try {
     const collection = await window.clipView.openPath(targetPath);
+    if (sequence !== openSequence) return;
     if (!collection.items.length) {
       showToast("지원되는 파일이 없습니다.", true);
       return;
     }
     state.items = collection.items;
     state.index = collection.index;
+    selectionSequence += 1;
     state.comic = collection.comic || null;
     imageCache.clear();
+    thumbnailRenderSequence += 1;
+    $("thumbnailStrip").innerHTML = "";
     updateUi();
     await loadCurrent();
     if (state.thumbsVisible) renderThumbnails();
   } catch (error) {
+    if (sequence !== openSequence) return;
     showToast(error?.message || "경로를 열지 못했습니다.", true);
   }
 }
 
-async function selectItem(index) {
+async function selectItem(index, options = {}) {
   if (!Number.isInteger(index) || index < 0 || index >= state.items.length) return;
-  stopSlideshow();
+  if (options.stopSlideshow !== false) stopSlideshow();
+  const sequence = ++selectionSequence;
   state.index = index;
   updateUi();
+  await new Promise((resolve) => setTimeout(resolve, options.immediate ? 0 : 40));
+  if (sequence !== selectionSequence) return;
   await loadCurrent();
 }
 
-function moveTo(delta) {
+function moveTo(delta, options = {}) {
   if (state.items.length < 2) return;
   let next = state.index + delta;
   if (state.settings.loop) {
@@ -755,7 +1111,7 @@ function moveTo(delta) {
     next = Math.max(0, Math.min(state.items.length - 1, next));
   }
   if (next !== state.index) {
-    void selectItem(next);
+    void selectItem(next, options);
   }
 }
 
@@ -763,6 +1119,7 @@ function toggleInfo(force) {
   state.infoVisible = force ?? !state.infoVisible;
   $("infoPanel").classList.toggle("hidden", !state.infoVisible);
   $("infoBtn").classList.toggle("active", state.infoVisible);
+  if (state.infoVisible && state.layersVisible) toggleLayers(false);
   setTimeout(() => state.fitMode && fitImage(), 0);
 }
 
@@ -789,9 +1146,11 @@ function videoPlaceholderDataUrl(item) {
 }
 
 async function renderThumbnails() {
+  const sequence = ++thumbnailRenderSequence;
+  const items = state.items;
   const strip = $("thumbnailStrip");
   strip.innerHTML = "";
-  state.items.forEach((item, index) => {
+  items.forEach((item, index) => {
     const element = document.createElement("div");
     element.className = `thumb-item${index === state.index ? " active" : ""}`;
     element.title = item.displayPath || item.path;
@@ -810,13 +1169,16 @@ async function renderThumbnails() {
   const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
     while (queue.length) {
       const { element, index } = queue.shift();
+      const item = items[index];
       try {
-        const item = state.items[index];
-        element.querySelector("img").src = isVideoItem(item)
+        const source = isVideoItem(item)
           ? videoPlaceholderDataUrl(item)
           : await window.clipView.loadThumbnail(item);
+        if (sequence !== thumbnailRenderSequence || !element.isConnected) return;
+        element.querySelector("img").src = source;
       } catch {
-        element.querySelector("span").textContent = `미리보기 없음 · ${state.items[index].name}`;
+        if (sequence !== thumbnailRenderSequence || !element.isConnected) return;
+        element.querySelector("span").textContent = `미리보기 없음 · ${item.name}`;
       }
     }
   });
@@ -828,7 +1190,10 @@ function startSlideshow() {
   stopSlideshow();
   $("slideshowBtn").classList.add("active");
   $("slideshowBtn").textContent = "정지";
-  state.slideshowTimer = setInterval(() => moveTo(1), state.settings.slideInterval);
+  state.slideshowTimer = setInterval(
+    () => moveTo(1, { stopSlideshow: false, immediate: true }),
+    state.settings.slideInterval,
+  );
 }
 
 function stopSlideshow() {
@@ -983,7 +1348,13 @@ async function initializeRuntimeInfo() {
   } else {
     $("associationHelp").textContent =
       "선택한 형식을 Windows 기본 앱 후보로 등록합니다. 보안 정책상 실제 기본 앱 지정은 이어서 열리는 Windows 설정에서 직접 확인해야 합니다.";
-    const enabled = localStorage.getItem("associationsEnabled") !== "false";
+    const savedEnabled = localStorage.getItem("associationsEnabled");
+    const enabled = savedEnabled === null
+      ? state.runtime.associationsEnabled !== false
+      : savedEnabled !== "false";
+    if (savedEnabled === null) {
+      localStorage.setItem("associationsEnabled", String(enabled));
+    }
     const registrationToken = `${state.runtime.version}:capabilities-v2`;
     const syncedVersion = localStorage.getItem("associationRegistrationVersion");
     if (enabled && syncedVersion !== registrationToken) {
@@ -1076,10 +1447,17 @@ function bindActions() {
   };
   videoFullscreenBtn.onclick = toggleFullscreen;
   video.onclick = (event) => {
-    if (event.detail === 1) toggleVideoPlayback();
+    if (event.detail !== 1) return;
+    clearTimeout(videoClickTimer);
+    videoClickTimer = setTimeout(() => {
+      videoClickTimer = null;
+      toggleVideoPlayback();
+    }, 220);
   };
   $("infoBtn").onclick = () => toggleInfo();
   $("closeInfoBtn").onclick = () => toggleInfo(false);
+  $("layerBtn").onclick = () => toggleLayers();
+  $("closeLayerBtn").onclick = () => toggleLayers(false);
   $("thumbBtn").onclick = () => toggleThumbnails();
   $("settingsBtn").onclick = openSettings;
   $("revealBtn").onclick = () => currentItem() && window.clipView.showInFolder(currentItem());
@@ -1131,7 +1509,7 @@ function bindActions() {
   };
   $("clearAssociationBtn").onclick = async () => {
     try {
-      await window.clipView.registerAssociations([], false);
+      await window.clipView.registerAssociations([]);
       localStorage.setItem("associationExtensions", "[]");
       localStorage.setItem("associationsEnabled", "false");
       localStorage.setItem(
@@ -1163,6 +1541,23 @@ function bindActions() {
   videoControls.addEventListener("mousedown", (event) => event.stopPropagation());
   videoControls.addEventListener("dblclick", (event) => event.stopPropagation());
   videoControls.addEventListener("mousemove", () => showVideoControls("full", 2000));
+  for (const input of [videoSeek, videoVolume]) {
+    input.addEventListener("pointerdown", () => {
+      videoControlInteracting = true;
+      showVideoControls(state.videoControlsMode, 0, {
+        lockMode: state.videoControlsMode !== "full",
+      });
+    });
+    input.addEventListener("pointerup", () => {
+      videoControlInteracting = false;
+      showVideoControls(state.videoControlsMode, 2000, {
+        lockMode: state.videoControlsMode !== "full",
+      });
+    });
+    input.addEventListener("pointercancel", () => {
+      videoControlInteracting = false;
+    });
+  }
   videoContextMenu.querySelectorAll("[data-video-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       setVideoPlaybackMode(button.dataset.videoMode);
@@ -1210,6 +1605,11 @@ imageLayer.addEventListener("mousedown", (event) => {
   if (event.button !== 0) return;
   if (event.target.closest(".video-controls")) return;
   if (state.mediaType === "video" && event.target === video) return;
+  if (event.ctrlKey && state.mediaType === "image" && state.layerDocument?.pickSupported) {
+    event.preventDefault();
+    void pickLayerAt(event);
+    return;
+  }
   state.dragging = true;
   state.dragStartX = event.clientX;
   state.dragStartY = event.clientY;
@@ -1230,6 +1630,18 @@ window.addEventListener("mouseup", () => {
   imageLayer.classList.remove("dragging");
 });
 
+window.addEventListener("pointerup", () => {
+  if (!videoControlInteracting) return;
+  videoControlInteracting = false;
+  showVideoControls(state.videoControlsMode, 2000, {
+    lockMode: state.videoControlsMode !== "full",
+  });
+});
+
+window.addEventListener("pointercancel", () => {
+  videoControlInteracting = false;
+});
+
 window.addEventListener("click", (event) => {
   if (!event.target.closest(".video-context-menu")) hideVideoContextMenu();
 });
@@ -1244,22 +1656,28 @@ window.addEventListener("keydown", async (event) => {
   if (handleVideoShortcut(event, key)) {
     return;
   }
+  const formControl = event.target.closest?.("input, select, textarea");
+  if (formControl && formControl.id !== "cropModeSelect") return;
   if (event.ctrlKey && key === "o") {
     event.preventDefault();
     const kind = event.shiftKey ? "folder" : "file";
     openPath(await window.clipView.openDialog(kind));
   } else if (event.ctrlKey && key === "c") {
+    event.preventDefault();
     const dataUrl = transformedPngDataUrl();
     if (dataUrl) {
       await window.clipView.copyImage(dataUrl);
       showToast("이미지를 클립보드에 복사했습니다.");
     }
   } else if (event.ctrlKey && key === "s") {
+    event.preventDefault();
     const dataUrl = transformedPngDataUrl();
     if (dataUrl) {
       const stem = currentItem().name.replace(/\.[^.]+$/, "");
       await window.clipView.saveImageCopy(dataUrl, `${stem}.png`);
     }
+  } else if (event.ctrlKey || event.altKey || event.metaKey) {
+    return;
   } else if (["arrowleft", "pageup"].includes(key)) {
     event.preventDefault();
     moveTo(-1);
@@ -1282,6 +1700,8 @@ window.addEventListener("keydown", async (event) => {
     applyTransform();
   } else if (key === "i") {
     toggleInfo();
+  } else if (key === "l") {
+    toggleLayers();
   } else if (key === "t") {
     toggleThumbnails();
   } else if (key === "s") {
@@ -1300,6 +1720,8 @@ window.addEventListener("keydown", async (event) => {
 
 stage.addEventListener("dblclick", (event) => {
   if (event.target.closest("button, input, select, .video-controls")) return;
+  clearTimeout(videoClickTimer);
+  videoClickTimer = null;
   void toggleFullscreen();
 });
 
@@ -1321,6 +1743,11 @@ document.addEventListener("drop", (event) => {
 
 window.clipView.onOpenExternalPath(openPath);
 window.clipView.onUpdateState(applyUpdateState);
+window.clipView.onFullscreenState((enabled) => {
+  state.fullscreen = enabled;
+  document.body.classList.toggle("fullscreen-ui", enabled);
+  setTimeout(() => state.fitMode && fitImage(), 0);
+});
 bindActions();
 applyBackground(state.settings.background);
 void initializeRuntimeInfo().catch(() => {});

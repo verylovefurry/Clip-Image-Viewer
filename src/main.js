@@ -23,6 +23,7 @@ const {
   OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS,
   PROJECT_EXTENSIONS,
   SUPPORTED_EXTENSIONS,
+  VIDEO_MIME_TYPES,
   extensionOf,
   findComicProject,
   isSupported,
@@ -38,6 +39,7 @@ const OPTIONAL_ASSOCIATION_COUNT = (
   OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS.length
 );
 const SUBTITLE_EXTENSIONS = new Set([".vtt", ".srt", ".ass", ".ssa"]);
+const MAX_SUBTITLE_BYTES = 20 * 1024 * 1024;
 const PRODUCT_NAME = "Clip Image Viewer";
 const PROG_ID_PREFIX = "ClipImageViewer";
 const CAPABILITIES_KEY = "HKCU\\Software\\ClipImageViewer\\Capabilities";
@@ -45,7 +47,7 @@ const REGISTERED_APPLICATIONS_KEY = "HKCU\\Software\\RegisteredApplications";
 const ASSOCIATION_SETTINGS_KEY = "HKCU\\Software\\ClipImageViewer\\Settings";
 let mainWindow;
 let pendingOpenPath = null;
-let imageLoader;
+let imageWorker;
 let installedAutoUpdater;
 let updaterInitialization;
 let updateCheckPromise;
@@ -130,6 +132,69 @@ function saveWindowState() {
   }));
 }
 
+function attachPackagedSmokeTest(window, expectedPath) {
+  window.webContents.once("did-finish-load", async () => {
+    try {
+      let result = null;
+      for (let attempt = 0; attempt < 300; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        result = await window.webContents.executeJavaScript(`(() => {
+          const image = document.getElementById("viewerImage");
+          return {
+            title: document.title,
+            rendered: image.complete && image.naturalWidth > 0,
+            loading: !document.getElementById("loading").classList.contains("hidden"),
+          };
+        })()`);
+        if (
+          (!expectedPath || result.title !== PRODUCT_NAME) &&
+          result.rendered &&
+          !result.loading
+        ) break;
+      }
+      if (expectedPath && (result?.title === PRODUCT_NAME || !result?.rendered)) {
+        throw new Error(`Packaged image loading failed: ${JSON.stringify(result)}`);
+      }
+      if (process.env.CLIPVIEW_SMOKE_OPEN_LAYERS === "1") {
+        let layers = null;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          layers = await window.webContents.executeJavaScript(`(() => {
+            const button = document.getElementById("layerBtn");
+            if (!button.classList.contains("hidden")) button.click();
+            return {
+              count: document.querySelectorAll(".layer-row").length,
+              buttonHidden: button.classList.contains("hidden"),
+              thumbnailCount: document.querySelectorAll(".layer-thumbnail").length,
+              toast: document.getElementById("toast").textContent,
+            };
+          })()`);
+          if (layers.count) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (!layers?.count) {
+          throw new Error(`Packaged layer panel failed: ${JSON.stringify(layers)}`);
+        }
+        if (layers.thumbnailCount) {
+          let thumbnailReady = false;
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            thumbnailReady = await window.webContents.executeJavaScript(
+              "document.querySelector('.layer-thumbnail')?.naturalWidth > 0",
+            );
+            if (thumbnailReady) break;
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          if (!thumbnailReady) throw new Error("Packaged layer thumbnail failed");
+        }
+      }
+      console.log(`${PRODUCT_NAME} packaged smoke test passed: ${result?.title}`);
+      app.exit(0);
+    } catch (error) {
+      console.error(`${PRODUCT_NAME} packaged smoke test failed: ${error.stack || error.message}`);
+      app.exit(1);
+    }
+  });
+}
+
 function createWindow() {
   const initialState = getInitialWindowState();
   const smokeExpectedPath = pendingOpenPath;
@@ -164,216 +229,24 @@ function createWindow() {
     });
   }
   if (smokeTest) {
-    mainWindow.webContents.once("did-finish-load", async () => {
-      try {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        let title = await mainWindow.webContents.executeJavaScript("document.title");
-        if (smokeExpectedPath) {
-          for (let attempt = 0; attempt < 100; attempt += 1) {
-            const rendered = await mainWindow.webContents.executeJavaScript(`(() => {
-              const layer = document.getElementById("imageLayer");
-              const loading = document.getElementById("loading");
-              const image = document.getElementById("viewerImage");
-              return (
-                !layer.classList.contains("hidden") &&
-                loading.classList.contains("hidden") &&
-                image.complete &&
-                image.naturalWidth > 0
-              );
-            })()`);
-            title = await mainWindow.webContents.executeJavaScript("document.title");
-            if (title !== PRODUCT_NAME && rendered) break;
-            await new Promise((resolve) => setTimeout(resolve, 100));
-          }
-          if (title === PRODUCT_NAME) {
-            throw new Error("Image did not finish loading");
-          }
-        }
-        await mainWindow.webContents.executeJavaScript(
-          "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
-        );
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        if (smokeListTest) {
-          const itemCount = await mainWindow.webContents.executeJavaScript(`(() => {
-            document.getElementById("thumbBtn").click();
-            const items = document.querySelectorAll(".thumb-item");
-            if (items.length > 1) items[1].click();
-            return items.length;
-          })()`);
-          if (itemCount < 2) throw new Error("Thumbnail smoke test needs at least two items");
-
-          const previousTitle = title;
-          for (let attempt = 0; attempt < 40; attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            title = await mainWindow.webContents.executeJavaScript("document.title");
-            const visible = await mainWindow.webContents.executeJavaScript(
-              "!document.getElementById('imageLayer').classList.contains('hidden')",
-            );
-            if (title !== previousTitle && visible) break;
-          }
-          if (title === previousTitle) {
-            throw new Error("Thumbnail selection did not change the displayed image");
-          }
-        }
-        if (smokeNavigationTest) {
-          await mainWindow.webContents.executeJavaScript(`(() => {
-            const select = document.getElementById("cropModeSelect");
-            select.value = "trim";
-            select.dispatchEvent(new Event("change", { bubbles: true }));
-          })()`);
-          await new Promise((resolve) => setTimeout(resolve, 800));
-          const before = await mainWindow.webContents.executeJavaScript(`(() => {
-            const select = document.getElementById("cropModeSelect");
-            select.focus();
-            return { mode: select.value, title: document.title };
-          })()`);
-          mainWindow.webContents.sendInputEvent({ type: "keyDown", keyCode: "LEFT" });
-          mainWindow.webContents.sendInputEvent({ type: "keyUp", keyCode: "LEFT" });
-          await new Promise((resolve) => setTimeout(resolve, 30));
-          const immediate = await mainWindow.webContents.executeJavaScript(`(() => ({
-            loadingHidden: document.getElementById("loading").classList.contains("hidden"),
-            mode: document.getElementById("cropModeSelect").value,
-            title: document.title,
-          }))()`);
-          if (immediate.mode !== before.mode) {
-            throw new Error(`Arrow key changed crop mode: ${JSON.stringify({ before, immediate })}`);
-          }
-          if (immediate.title === before.title) {
-            throw new Error("Arrow key did not navigate while crop mode was focused");
-          }
-          if (!immediate.loadingHidden) {
-            throw new Error("Adjacent page was not served from the preload cache");
-          }
-          title = immediate.title;
-        }
-        if (smokeSettingsTest) {
-          await mainWindow.webContents.executeJavaScript(
-            "document.getElementById('settingsBtn').click()",
-          );
-          let settings;
-          for (let attempt = 0; attempt < 40; attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 50));
-            settings = await mainWindow.webContents.executeJavaScript(`(() => ({
-              open: document.getElementById("settingsDialog").open,
-              count: document.querySelectorAll(".association-extension").length,
-              controlsHidden: document.getElementById("associationControls")
-                .classList.contains("hidden"),
-            }))()`);
-            if (settings.count) break;
-          }
-          if (!settings?.open || settings.count !== OPTIONAL_ASSOCIATION_COUNT) {
-            throw new Error(`Association settings failed: ${JSON.stringify(settings)}`);
-          }
-          const associationControlsExpectedHidden = !fileAssociationSupported();
-          if (settings.controlsHidden !== associationControlsExpectedHidden) {
-            throw new Error(`Portable association UI failed: ${JSON.stringify(settings)}`);
-          }
-          await mainWindow.webContents.executeJavaScript(
-            "document.getElementById('settingsDialog').close()",
-          );
-        }
-        await mainWindow.webContents.executeJavaScript(
-          "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
-        );
-        const geometry = await mainWindow.webContents.executeJavaScript(`(() => {
-          const stage = document.getElementById("stage").getBoundingClientRect();
-          const image = document.getElementById("viewerImage");
-          const topbar = document.querySelector(".topbar").getBoundingClientRect();
-          const bottombar = document.querySelector(".bottombar").getBoundingClientRect();
-          if (!image.naturalWidth) return null;
-          const imageRect = image.getBoundingClientRect();
-          return {
-            deltaX: (imageRect.left + imageRect.width / 2) - (stage.left + stage.width / 2),
-            deltaY: (imageRect.top + imageRect.height / 2) - (stage.top + stage.height / 2),
-            gapX: stage.width - imageRect.width,
-            gapY: stage.height - imageRect.height,
-            overflowLeft: stage.left - imageRect.left,
-            overflowTop: stage.top - imageRect.top,
-            overflowRight: imageRect.right - stage.right,
-            overflowBottom: imageRect.bottom - stage.bottom,
-            topbarGap: stage.top - topbar.bottom,
-            bottombarGap: bottombar.top - stage.bottom,
-          };
-        })()`);
-        if (geometry && (Math.abs(geometry.deltaX) > 1 || Math.abs(geometry.deltaY) > 1)) {
-          throw new Error(`Image is not centered: ${JSON.stringify(geometry)}`);
-        }
-        if (geometry && (
-          geometry.overflowLeft > 1 ||
-          geometry.overflowTop > 1 ||
-          geometry.overflowRight > 1 ||
-          geometry.overflowBottom > 1
-        )) {
-          throw new Error(`Image exceeds the viewer area: ${JSON.stringify(geometry)}`);
-        }
-        if (geometry && Math.min(Math.abs(geometry.gapX), Math.abs(geometry.gapY)) > 2) {
-          throw new Error(`Image is not fitted to the viewer area: ${JSON.stringify(geometry)}`);
-        }
-        if (geometry && (
-          Math.abs(geometry.topbarGap) > 1 ||
-          Math.abs(geometry.bottombarGap) > 1
-        )) {
-          throw new Error(`Viewer area does not match the bars: ${JSON.stringify(geometry)}`);
-        }
-        const navigationGeometry = await mainWindow.webContents.executeJavaScript(`(() => {
-          return ["prevOverlay", "nextOverlay", "prevBtn", "nextBtn"].flatMap((id) => {
-            const button = document.getElementById(id);
-            if (button.classList.contains("hidden")) return [];
-            const icon = button.querySelector(".nav-icon");
-            const buttonRect = button.getBoundingClientRect();
-            const iconRect = icon.getBoundingClientRect();
-            const pathBox = icon.querySelector("path").getBBox();
-            return [{
-              id,
-              deltaX: (iconRect.left + iconRect.width / 2) -
-                (buttonRect.left + buttonRect.width / 2),
-              deltaY: (iconRect.top + iconRect.height / 2) -
-                (buttonRect.top + buttonRect.height / 2),
-              pathDeltaX: pathBox.x + pathBox.width / 2 - 10,
-              pathDeltaY: pathBox.y + pathBox.height / 2 - 10,
-            }];
-          });
-        })()`);
-        const misalignedNavigation = navigationGeometry.find((item) => (
-          Math.abs(item.deltaX) > 0.1 ||
-          Math.abs(item.deltaY) > 0.1 ||
-          Math.abs(item.pathDeltaX) > 0.1 ||
-          Math.abs(item.pathDeltaY) > 0.1
-        ));
-        if (misalignedNavigation) {
-          throw new Error(
-            `Navigation icon is not centered: ${JSON.stringify(misalignedNavigation)}`,
-          );
-        }
-        const fullscreenBeforeNavigationDoubleClick = mainWindow.isFullScreen();
-        await mainWindow.webContents.executeJavaScript(`(() => {
-          document.getElementById("prevOverlay").dispatchEvent(new MouseEvent("dblclick", {
-            bubbles: true,
-            cancelable: true,
-          }));
-        })()`);
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        if (mainWindow.isFullScreen() !== fullscreenBeforeNavigationDoubleClick) {
-          throw new Error("Navigation button double click toggled fullscreen");
-        }
-        const screenshotPath = process.env.CLIPVIEW_SMOKE_SCREENSHOT;
-        if (screenshotPath) {
-          const image = await mainWindow.webContents.capturePage();
-          fs.writeFileSync(screenshotPath, image.toPNG());
-        }
-        const bounds = mainWindow.getBounds();
-        if (!smokeUseWindowState && Math.abs(bounds.width / bounds.height - 3 / 4) > 0.002) {
-          throw new Error(`Initial window is not 3:4: ${JSON.stringify(bounds)}`);
-        }
-        console.log(
-          `${PRODUCT_NAME} smoke test passed: ${title} (${bounds.width}x${bounds.height})`,
-        );
-        app.exit(0);
-      } catch (error) {
-        console.error(`${PRODUCT_NAME} smoke test failed: ${error.stack || error.message}`);
-        app.exit(1);
-      }
-    });
+    if (app.isPackaged) {
+      attachPackagedSmokeTest(mainWindow, smokeExpectedPath);
+    } else {
+      const { attachElectronSmoke } = require("../test/electron-smoke");
+      attachElectronSmoke({
+        app,
+        mainWindow,
+        expectedPath: smokeExpectedPath,
+        productName: PRODUCT_NAME,
+        screen,
+        smokeListTest,
+        smokeNavigationTest,
+        smokeSettingsTest,
+        smokeUseWindowState,
+        optionalAssociationCount: OPTIONAL_ASSOCIATION_COUNT,
+        fileAssociationSupported,
+      });
+    }
   }
   mainWindow.once("ready-to-show", () => {
     if (initialState.isMaximized) mainWindow.maximize();
@@ -399,6 +272,13 @@ function createWindow() {
     }
   });
   mainWindow.on("close", saveWindowState);
+  const sendFullscreenState = () => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("fullscreen-state", mainWindow.isFullScreen());
+    }
+  };
+  mainWindow.on("enter-full-screen", sendFullscreenState);
+  mainWindow.on("leave-full-screen", sendFullscreenState);
 }
 
 function itemForPath(filePath) {
@@ -488,15 +368,19 @@ function subtitleLabel(videoBase, subtitlePath) {
 }
 
 function subtitleLanguage(label) {
-  const normalized = label.toLowerCase();
+  const normalized = label.toLowerCase().split(/[._-]/)[0];
   if (["ko", "kor", "kr", "korean", "한국어"].includes(normalized)) return "ko";
   if (["ja", "jpn", "jp", "japanese", "日本語"].includes(normalized)) return "ja";
   if (["en", "eng", "english"].includes(normalized)) return "en";
   return "und";
 }
 
-function readSubtitleText(subtitlePath) {
-  const buffer = fs.readFileSync(subtitlePath);
+async function readSubtitleText(subtitlePath) {
+  const stat = await fs.promises.stat(subtitlePath);
+  if (stat.size > MAX_SUBTITLE_BYTES) {
+    throw new Error("20MB를 넘는 자막 파일은 안전을 위해 불러오지 않습니다.");
+  }
+  const buffer = await fs.promises.readFile(subtitlePath);
   if (buffer[0] === 0xFF && buffer[1] === 0xFE) {
     return new TextDecoder("utf-16le").decode(buffer);
   }
@@ -512,9 +396,9 @@ function readSubtitleText(subtitlePath) {
   }
 }
 
-function subtitleToVtt(subtitlePath) {
+async function subtitleToVtt(subtitlePath) {
   const ext = extensionOf(subtitlePath);
-  const content = readSubtitleText(subtitlePath);
+  const content = await readSubtitleText(subtitlePath);
   if (ext === ".srt") return srtToVtt(content);
   if (ext === ".ass" || ext === ".ssa") return assToVtt(content);
   return content.replace(/^\uFEFF/, "").startsWith("WEBVTT")
@@ -522,10 +406,10 @@ function subtitleToVtt(subtitlePath) {
     : `WEBVTT\n\n${content}`;
 }
 
-function findSubtitleFiles(videoPath) {
+async function findSubtitleFiles(videoPath) {
   const folderPath = path.dirname(videoPath);
   const videoBase = path.basename(videoPath, path.extname(videoPath));
-  return fs.readdirSync(folderPath, { withFileTypes: true })
+  return (await fs.promises.readdir(folderPath, { withFileTypes: true }))
     .filter((entry) => {
       if (!entry.isFile()) return false;
       const ext = extensionOf(entry.name);
@@ -537,9 +421,12 @@ function findSubtitleFiles(videoPath) {
     .sort((a, b) => naturalCompare(path.basename(a), path.basename(b)));
 }
 
-function getImageLoader() {
-  if (!imageLoader) imageLoader = require("./image-loader");
-  return imageLoader;
+function getImageWorker() {
+  if (!imageWorker) {
+    const { ImageWorkerClient } = require("./image-worker-client");
+    imageWorker = new ImageWorkerClient();
+  }
+  return imageWorker;
 }
 
 async function comicCollection(cmcPath, targetPath = null) {
@@ -579,7 +466,7 @@ async function buildCollection(targetPath) {
 
   const target = itemForPath(targetPath);
   if (target.kind === "archive") {
-    const items = getImageLoader().listArchive(targetPath);
+    const items = await getImageWorker().invoke("listArchive", targetPath);
     return { items, index: items.length ? 0 : -1, basePath: targetPath };
   }
 
@@ -749,6 +636,21 @@ function saveAssociationPreference(enabled) {
     enabled ? "1" : "0",
     "/f",
   ]);
+}
+
+function readAssociationPreference() {
+  if (process.platform !== "win32") return null;
+  try {
+    const output = execFileSync(
+      "reg.exe",
+      ["query", ASSOCIATION_SETTINGS_KEY, "/v", "AssociationsEnabled"],
+      { windowsHide: true, encoding: "utf8" },
+    );
+    const match = output.match(/AssociationsEnabled\s+REG_DWORD\s+0x([0-9a-f]+)/i);
+    return match ? Number.parseInt(match[1], 16) !== 0 : null;
+  } catch {
+    return null;
+  }
 }
 
 function isPortableBuild() {
@@ -970,8 +872,33 @@ function launchPortableUpdate() {
     "  [string]$ScriptPath",
     ")",
     "Wait-Process -Id $AppProcessId -ErrorAction SilentlyContinue",
+    "$TargetFullPath = [IO.Path]::GetFullPath($TargetPath)",
+    "$ManagedBackups = @()",
+    "foreach ($ManagedName in @('resources', 'locales')) {",
+    "  $ManagedPath = [IO.Path]::GetFullPath((Join-Path $TargetFullPath $ManagedName))",
+    "  $BackupPath = [IO.Path]::GetFullPath($ManagedPath + '.update-backup')",
+    "  if (-not $ManagedPath.StartsWith($TargetFullPath + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {",
+    "    exit 90",
+    "  }",
+    "  Remove-Item -LiteralPath $BackupPath -Recurse -Force -ErrorAction SilentlyContinue",
+    "  if (Test-Path -LiteralPath $ManagedPath) {",
+    "    Move-Item -LiteralPath $ManagedPath -Destination $BackupPath -Force",
+    "    $ManagedBackups += [PSCustomObject]@{ Target = $ManagedPath; Backup = $BackupPath }",
+    "  }",
+    "}",
     "& robocopy.exe $SourcePath $TargetPath /E /R:10 /W:1 /NFL /NDL /NJH /NJS /NP",
-    "if ($LASTEXITCODE -ge 8) { exit $LASTEXITCODE }",
+    "$CopyExitCode = $LASTEXITCODE",
+    "if ($CopyExitCode -ge 8) {",
+    "  foreach ($Item in $ManagedBackups) {",
+    "    Remove-Item -LiteralPath $Item.Target -Recurse -Force -ErrorAction SilentlyContinue",
+    "    Move-Item -LiteralPath $Item.Backup -Destination $Item.Target -Force -ErrorAction SilentlyContinue",
+    "  }",
+    "  if (Test-Path -LiteralPath $ExecutablePath) { Start-Process -FilePath $ExecutablePath }",
+    "  exit $CopyExitCode",
+    "}",
+    "foreach ($Item in $ManagedBackups) {",
+    "  Remove-Item -LiteralPath $Item.Backup -Recurse -Force -ErrorAction SilentlyContinue",
+    "}",
     "Start-Process -FilePath $ExecutablePath",
     "Remove-Item -LiteralPath (Split-Path $SourcePath) -Recurse -Force -ErrorAction SilentlyContinue",
     "Remove-Item -LiteralPath $ScriptPath -Force -ErrorAction SilentlyContinue",
@@ -1065,9 +992,23 @@ ipcMain.handle("open-dialog", async (_event, kind) => {
 
 ipcMain.handle("open-path", async (_event, targetPath) => buildCollection(targetPath));
 ipcMain.handle("load-image", async (_event, item, cropMode) => (
-  getImageLoader().loadImage(item, cropMode)
+  getImageWorker().invoke("loadImage", item, cropMode)
 ));
-ipcMain.handle("load-thumbnail", async (_event, item) => getImageLoader().loadThumbnail(item));
+ipcMain.handle("load-thumbnail", async (_event, item) => (
+  getImageWorker().invoke("loadThumbnail", item)
+));
+ipcMain.handle("load-layer-thumbnail", async (_event, item, id) => (
+  getImageWorker().invoke("loadLayerThumbnail", item, id)
+));
+ipcMain.handle("render-layered-image", async (_event, item, visibility) => (
+  getImageWorker().invoke("renderLayeredImage", item, visibility)
+));
+ipcMain.handle("prepare-layered-image", async (_event, item) => (
+  getImageWorker().invoke("prepareLayeredImage", item)
+));
+ipcMain.handle("pick-layer", async (_event, item, x, y, visibility) => (
+  getImageWorker().invoke("pickLayer", item, x, y, visibility)
+));
 
 ipcMain.handle("media-file-url", async (_event, item) => {
   if (!item || item.kind !== "file" || !item.path) {
@@ -1079,6 +1020,7 @@ ipcMain.handle("media-file-url", async (_event, item) => {
   const stat = fs.statSync(item.path);
   return {
     url: pathToFileURL(item.path).toString(),
+    mime: VIDEO_MIME_TYPES[extensionOf(item.path)] || "",
     metadata: {
       format: extensionOf(item.path).slice(1).toUpperCase(),
       byteSize: stat.size,
@@ -1093,15 +1035,16 @@ ipcMain.handle("find-subtitles", async (_event, item) => {
     return [];
   }
   const videoBase = path.basename(item.path, path.extname(item.path));
-  return findSubtitleFiles(item.path).map((subtitlePath) => {
+  const subtitlePaths = await findSubtitleFiles(item.path);
+  return Promise.all(subtitlePaths.map(async (subtitlePath) => {
     const label = subtitleLabel(videoBase, subtitlePath);
     return {
       name: path.basename(subtitlePath),
       label,
       srclang: subtitleLanguage(label),
-      vtt: subtitleToVtt(subtitlePath),
+      vtt: await subtitleToVtt(subtitlePath),
     };
-  });
+  }));
 });
 
 ipcMain.handle("copy-image", async (_event, dataUrl) => {
@@ -1149,6 +1092,7 @@ ipcMain.handle("get-runtime-info", () => ({
   optionalImageAssociations: OPTIONAL_IMAGE_ASSOCIATION_EXTENSIONS,
   optionalVideoAssociations: OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS,
   optionalAssociations: OPTIONAL_ASSOCIATION_EXTENSIONS,
+  associationsEnabled: readAssociationPreference(),
   updateSupported: updateSupported(),
   updateState,
 }));
@@ -1181,7 +1125,13 @@ if (!singleInstance) {
 } else {
   app.on("second-instance", (_event, argv) => {
     const targetPath = parseStartupPath(argv);
-    if (targetPath) mainWindow?.webContents.send("open-external-path", targetPath);
+    if (targetPath) {
+      if (mainWindow && !mainWindow.webContents.isLoadingMainFrame()) {
+        mainWindow.webContents.send("open-external-path", targetPath);
+      } else {
+        pendingOpenPath = targetPath;
+      }
+    }
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.focus();
@@ -1197,4 +1147,8 @@ if (!singleInstance) {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+
+app.on("will-quit", () => {
+  void imageWorker?.close();
 });

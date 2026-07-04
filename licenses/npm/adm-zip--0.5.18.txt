@@ -1,10 +1,10 @@
-Package: jiti@2.7.0
+Package: adm-zip@0.5.18
 Declared license: MIT
 ===== LICENSE =====
 
 MIT License
 
-Copyright (c) Pooya Parsa <pooya@pi0.io>
+Copyright (c) 2012 Another-D-Mention Software and other contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

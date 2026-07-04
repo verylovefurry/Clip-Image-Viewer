@@ -11,6 +11,7 @@ Clip Image Viewer includes third-party components under their own licenses.
 - BPG decoder/libbpg: ISC, BSD and LGPL-2.1 components
 - sql.js/SQLite: MIT and public domain
 - ag-psd, @webtoon/psd, adm-zip: package-specific open-source licenses
+- CLIP layer chunk decoding is adapted from dobrokot/clip_to_psd: MIT
 
 Complete license texts and package notices are distributed in the `licenses/`
 directory, including `licenses/npm/` for runtime npm packages.

@@ -11,12 +11,20 @@ const { loadComicProject } = require("../src/comic-loader");
 const {
   calculateCropRegion,
   extractClipPreview,
-  listFolder,
   loadImage,
-  naturalCompare,
+  loadLayerThumbnail,
+  pickLayer,
+  prepareLayeredImage,
   renderMagick,
+  renderLayeredImage,
 } = require("../src/image-loader");
-const { SUPPORTED_EXTENSIONS } = require("../src/file-types");
+const {
+  SUPPORTED_EXTENSIONS,
+  VIDEO_EXTENSIONS,
+  VIDEO_MIME_TYPES,
+  listFolder,
+  naturalCompare,
+} = require("../src/file-types");
 
 async function createSyntheticClip(outputPath) {
   const png = await sharp({
@@ -40,9 +48,35 @@ async function createSyntheticClip(outputPath) {
     CropFrameDitch REAL,
     CropFrameCropOffsetX REAL,
     CropFrameCropOffsetY REAL,
-    CropFrameShow INTEGER
+    CropFrameShow INTEGER,
+    CanvasRootFolder INTEGER
   )`);
-  db.run("INSERT INTO Canvas VALUES (96, 64, 48, 32, 4, 0, 0, 1)");
+  db.run("INSERT INTO Canvas VALUES (96, 64, 48, 32, 4, 0, 0, 1, 1)");
+  db.run(`CREATE TABLE Layer (
+    _PW_ID INTEGER PRIMARY KEY,
+    MainId INTEGER,
+    LayerName TEXT,
+    LayerType INTEGER,
+    LayerClip INTEGER,
+    LayerMasking INTEGER,
+    LayerOpacity INTEGER,
+    LayerComposite INTEGER,
+    LayerFolder INTEGER,
+    LayerVisibility INTEGER,
+    LayerNextIndex INTEGER,
+    LayerFirstChildIndex INTEGER,
+    LayerLayerMaskMipmap INTEGER,
+    LayerLayerMaskThumbnail INTEGER
+  )`);
+  db.run("INSERT INTO Layer VALUES (1, 1, '', 256, 0, 0, 256, 0, 1, 1, 0, 2, 0, 0)");
+  db.run("INSERT INTO Layer VALUES (2, 2, '테스트 레이어', 1, 0, 0, 192, 0, 0, 1, 0, 0, 0, 0)");
+  db.run("ALTER TABLE Layer ADD COLUMN TextLayerType INTEGER");
+  db.run("ALTER TABLE Layer ADD COLUMN TextLayerString BLOB");
+  const textStatement = db.prepare(
+    "UPDATE Layer SET LayerType=800, TextLayerType=2, TextLayerString=? WHERE MainId=2",
+  );
+  textStatement.run([Buffer.from("테스트 텍스트", "utf8")]);
+  textStatement.free();
   const statement = db.prepare("INSERT INTO CanvasPreview VALUES (?)");
   statement.run([png]);
   statement.free();
@@ -116,6 +150,40 @@ async function run() {
   }, "bleed");
   assert.equal(cropped.metadata.width, 56);
   assert.equal(cropped.metadata.height, 40);
+  assert.equal(cropped.layerDocument.format, "CLIP");
+  assert.equal(cropped.layerDocument.layers[0].name, "테스트 레이어");
+  assert.equal(cropped.layerDocument.layers[0].opacity, 75);
+  assert.equal(cropped.layerDocument.toggleSupported, true);
+  assert.equal(cropped.layerDocument.thumbnailSupported, true);
+  const clipLayerThumbnail = await loadLayerThumbnail({
+    kind: "file",
+    path: clipPath,
+    name: "sample.clip",
+  }, "2");
+  assert(clipLayerThumbnail.startsWith("data:image/png;base64,"));
+  const hiddenClip = await renderLayeredImage({
+    kind: "file",
+    path: clipPath,
+    name: "sample.clip",
+  }, { "2": false });
+  const hiddenClipStats = await sharp(
+    Buffer.from(hiddenClip.dataUrl.split(",")[1], "base64"),
+  ).stats();
+  assert.equal(hiddenClipStats.isOpaque, false);
+  assert.deepEqual(calculateCropRegion({
+    canvasWidth: 100,
+    canvasHeight: 100,
+    trimWidth: 80,
+    trimHeight: 80,
+    bleed: 0,
+    offsetX: -30,
+    offsetY: -30,
+  }, 100, 100, "trim"), {
+    left: 0,
+    top: 0,
+    width: 60,
+    height: 60,
+  });
 
   fs.writeFileSync(path.join(temp, "image10.png"), extracted);
   fs.writeFileSync(path.join(temp, "image2.png"), extracted);
@@ -149,6 +217,12 @@ async function run() {
     width: 32,
     height: 24,
     imageData: { width: 32, height: 24, data: psdPixels },
+    children: [{
+      name: "테스트 레이어",
+      left: 0,
+      top: 0,
+      imageData: { width: 32, height: 24, data: psdPixels },
+    }],
   }));
   const loadedPsd = await loadImage({
     kind: "file",
@@ -158,6 +232,38 @@ async function run() {
   assert.equal(loadedPsd.metadata.width, 32);
   assert.equal(loadedPsd.metadata.height, 24);
   assert(loadedPsd.dataUrl.startsWith("data:image/png;base64,"));
+  assert.equal(loadedPsd.layerDocument.format, "PSD");
+  assert.equal(loadedPsd.layerDocument.layers.length, 1);
+  assert.equal(loadedPsd.layerDocument.thumbnailSupported, true);
+  assert.equal(await prepareLayeredImage({
+    kind: "file",
+    path: psdPath,
+    name: "sample.psd",
+  }), true);
+  const layerThumbnail = await loadLayerThumbnail({
+    kind: "file",
+    path: psdPath,
+    name: "sample.psd",
+  }, "0");
+  assert(layerThumbnail.startsWith("data:image/png;base64,"));
+  const layerThumbnailMetadata = await sharp(
+    Buffer.from(layerThumbnail.split(",")[1], "base64"),
+  ).metadata();
+  assert.equal(layerThumbnailMetadata.width, 58);
+  assert.equal(layerThumbnailMetadata.height, 58);
+  const hiddenPsd = await renderLayeredImage({
+    kind: "file",
+    path: psdPath,
+    name: "sample.psd",
+  }, { "0": false });
+  const hiddenStats = await sharp(Buffer.from(hiddenPsd.dataUrl.split(",")[1], "base64"))
+    .stats();
+  assert.equal(hiddenStats.isOpaque, false);
+  assert.equal(await pickLayer({
+    kind: "file",
+    path: psdPath,
+    name: "sample.psd",
+  }, 4, 4, { "0": false }), null);
 
   const requiredExtensions = [
     ".bmp", ".jpg", ".gif", ".png", ".psd", ".dds", ".jxr", ".webp",
@@ -168,6 +274,7 @@ async function run() {
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".m2ts", ".ogv",
   ];
   requiredExtensions.forEach((ext) => assert(SUPPORTED_EXTENSIONS.has(ext), ext));
+  VIDEO_EXTENSIONS.forEach((ext) => assert(VIDEO_MIME_TYPES[ext], `missing MIME: ${ext}`));
 
   const sourcePng = await sharp({
     create: {

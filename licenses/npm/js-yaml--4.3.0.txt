@@ -1,4 +1,4 @@
-Package: js-yaml@4.2.0
+Package: js-yaml@4.3.0
 Declared license: MIT
 ===== LICENSE =====
 

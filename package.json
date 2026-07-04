@@ -1,6 +1,6 @@
 {
   "name": "clip-image-viewer",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Windows media viewer with CLIP STUDIO PAINT, RAW, modern image and video format support",
   "main": "src/main.js",
   "author": "verylovefurry",
@@ -8,13 +8,14 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node test/image-loader.test.js && node test/window-state.test.js && node test/updater.test.js",
+    "test": "node test/file-types.test.js && node test/clip-layer-reader.test.js && node test/image-loader.test.js && node test/image-worker.test.js && node test/window-state.test.js && node test/updater.test.js",
     "licenses": "node scripts/collect-licenses.js",
     "icon": "node scripts/make-icon.js",
     "build": "npm run build:release",
     "build:win": "npm run licenses && npm run icon && electron-builder --win nsis dir --x64",
-    "build:release": "npm run build:win && npm run package:portable",
-    "package:portable": "node scripts/package-portable.js"
+    "build:release": "npm run build:win && npm run package:portable && npm run package:checksums",
+    "package:portable": "node scripts/package-portable.js",
+    "package:checksums": "node scripts/create-checksums.js"
   },
   "dependencies": {
     "@discourse/jxr": "^1.0.0",
@@ -28,7 +29,6 @@
     "sql.js": "^1.13.0"
   },
   "optionalDependencies": {
-    "@julianberger/libraw.js": "^3.3.1",
     "lightdrift-libraw": "^1.0.0-alpha.6"
   },
   "devDependencies": {
@@ -68,11 +68,14 @@
       "node_modules/@img/**/*",
       "node_modules/sql.js/dist/*.wasm",
       "node_modules/lightdrift-libraw/build/Release/**/*",
-      "node_modules/@julianberger/libraw.js/prebuilds/**/*"
+      "node_modules/lightdrift-libraw/deps/LibRaw-Win64/**/*"
     ],
     "win": {
       "icon": "build/icon.ico",
-      "target": ["nsis", "dir"],
+      "target": [
+        "nsis",
+        "dir"
+      ],
       "artifactName": "Clip-Image-Viewer-Setup-${version}-${arch}.${ext}"
     },
     "nsis": {
