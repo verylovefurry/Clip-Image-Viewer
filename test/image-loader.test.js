@@ -10,6 +10,7 @@ const { writePsdBuffer } = require("ag-psd");
 const { loadComicProject } = require("../src/comic-loader");
 const {
   calculateCropRegion,
+  extractClipData,
   extractClipPreview,
   loadImage,
   loadLayerThumbnail,
@@ -25,6 +26,45 @@ const {
   listFolder,
   naturalCompare,
 } = require("../src/file-types");
+
+function u32le(value) {
+  const output = Buffer.alloc(4);
+  output.writeUInt32LE(value);
+  return output;
+}
+
+function i32le(value) {
+  const output = Buffer.alloc(4);
+  output.writeInt32LE(value);
+  return output;
+}
+
+function lengthPrefixed(entries) {
+  return Buffer.concat(entries.map((entry) => {
+    const data = Buffer.isBuffer(entry) ? entry : Buffer.from(entry, "utf8");
+    return Buffer.concat([u32le(data.length), data]);
+  }));
+}
+
+function textAttributes(font, fontSize, bounds, options = {}) {
+  const parameter = (id, value) => Buffer.concat([u32le(id), u32le(value.length), value]);
+  return Buffer.concat([
+    parameter(31, Buffer.from(font, "utf8")),
+    parameter(32, u32le(fontSize)),
+    parameter(33, u32le(options.style || 0)),
+    parameter(34, Buffer.concat([u32le(0), u32le(0), u32le(0)])),
+    parameter(35, u32le(options.align || 0)),
+    parameter(42, Buffer.concat(bounds.map(i32le))),
+    parameter(56, Buffer.concat([
+      i32le(options.edge?.enabled ? 1 : 0),
+      i32le(options.edge?.width || 1000),
+      i32le(0),
+      u32le(0xffffffff),
+      u32le(0xffffffff),
+      u32le(0xffffffff),
+    ])),
+  ]);
+}
 
 async function createSyntheticClip(outputPath) {
   const png = await sharp({
@@ -72,10 +112,32 @@ async function createSyntheticClip(outputPath) {
   db.run("INSERT INTO Layer VALUES (2, 2, '테스트 레이어', 1, 0, 0, 192, 0, 0, 1, 0, 0, 0, 0)");
   db.run("ALTER TABLE Layer ADD COLUMN TextLayerType INTEGER");
   db.run("ALTER TABLE Layer ADD COLUMN TextLayerString BLOB");
-  const textStatement = db.prepare(
-    "UPDATE Layer SET LayerType=800, TextLayerType=2, TextLayerString=? WHERE MainId=2",
+  db.run("ALTER TABLE Layer ADD COLUMN TextLayerAttributes BLOB");
+  db.run("ALTER TABLE Layer ADD COLUMN TextLayerStringArray BLOB");
+  db.run("ALTER TABLE Layer ADD COLUMN TextLayerAttributesArray BLOB");
+  db.run("ALTER TABLE Layer ADD COLUMN TextLayerAddAttributesV01 BLOB");
+  const primaryAttributes = textAttributes(
+    "Malgun Gothic",
+    1200,
+    [4, 4, 48, 20],
+    { style: 16, align: 2, edge: { enabled: true, width: 2500 } },
   );
-  textStatement.run([Buffer.from("테스트 텍스트", "utf8")]);
+  const additionalAttributes = [
+    textAttributes("Arial", 1000, [8, 24, 70, 38]),
+    textAttributes("Malgun Gothic", 900, [20, 40, 90, 60]),
+  ];
+  const textStatement = db.prepare(
+    `UPDATE Layer SET LayerType=800, TextLayerType=0, TextLayerString=?,
+      TextLayerAttributes=?, TextLayerStringArray=?, TextLayerAttributesArray=?,
+      TextLayerAddAttributesV01=? WHERE MainId=2`,
+  );
+  textStatement.run([
+    Buffer.from("첫 텍스트", "utf8"),
+    primaryAttributes,
+    lengthPrefixed([" 추가 텍스트", "세 번째\n텍스트"]),
+    lengthPrefixed(additionalAttributes),
+    lengthPrefixed([Buffer.from([1]), Buffer.from([2]), Buffer.from([3])]),
+  ]);
   textStatement.free();
   const statement = db.prepare("INSERT INTO CanvasPreview VALUES (?)");
   statement.run([png]);
@@ -128,6 +190,24 @@ async function run() {
   const metadata = await sharp(extracted).metadata();
   assert.equal(metadata.width, 96);
   assert.equal(metadata.height, 64);
+  const clipData = await extractClipData(clipPath);
+  const textLayer = clipData.layerDocument.layers[0];
+  assert.equal(textLayer.type, "text");
+  assert.equal(textLayer.textObjectCount, 3);
+  assert.deepEqual(textLayer.textObjects.map((object) => object.text), [
+    "첫 텍스트",
+    " 추가 텍스트",
+    "세 번째\n텍스트",
+  ]);
+  assert.equal(textLayer.textObjects[1].attributes.font, "Arial");
+  assert.deepEqual(textLayer.textObjects[2].attributes.bounds, [20, 40, 90, 60]);
+  assert.equal(textLayer.textObjects[0].attributes.vertical, true);
+  assert.equal(textLayer.textObjects[0].attributes.align, 2);
+  assert.deepEqual(textLayer.textObjects[0].attributes.edge, {
+    enabled: true,
+    width: 2.5,
+    color: [255, 255, 255],
+  });
   assert.deepEqual(calculateCropRegion({
     canvasWidth: 96,
     canvasHeight: 64,
@@ -157,7 +237,7 @@ async function run() {
   assert.equal(cropped.layerDocument.thumbnailSupported, true);
   assert.equal(
     cropped.layerDocument.layers[0].previewAccuracy,
-    "원본 합성 문맥 래스터(정확)",
+    "텍스트 객체 재구성(근사)",
   );
   const clipLayerThumbnail = await loadLayerThumbnail({
     kind: "file",
@@ -165,14 +245,11 @@ async function run() {
     name: "sample.clip",
   }, "2");
   assert(clipLayerThumbnail.startsWith("data:image/png;base64,"));
-  const clipThumbnailPixel = await sharp(
+  const clipThumbnailMetadata = await sharp(
     Buffer.from(clipLayerThumbnail.split(",")[1], "base64"),
-  ).ensureAlpha().raw().toBuffer();
-  const clipThumbnailCenter = (29 * 58 + 29) * 4;
-  assert.deepEqual(
-    [...clipThumbnailPixel.subarray(clipThumbnailCenter, clipThumbnailCenter + 4)],
-    [70, 120, 230, 255],
-  );
+  ).metadata();
+  assert.equal(clipThumbnailMetadata.width, 58);
+  assert.equal(clipThumbnailMetadata.height, 58);
   const hiddenClip = await renderLayeredImage({
     kind: "file",
     path: clipPath,

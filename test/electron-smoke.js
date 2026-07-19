@@ -2,6 +2,17 @@
 
 const fs = require("fs");
 
+function ignoreBrokenPipe(stream) {
+  if (!stream || typeof stream.on !== "function") return;
+  stream.on("error", (error) => {
+    if (error?.code === "EPIPE") return;
+    process.exitCode = 1;
+  });
+}
+
+ignoreBrokenPipe(process.stdout);
+ignoreBrokenPipe(process.stderr);
+
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -136,6 +147,7 @@ function attachElectronSmoke({
             count: document.querySelectorAll(".layer-row").length,
             detailsVisible: !document.getElementById("layerDetails").classList.contains("hidden"),
             thumbnailCount: document.querySelectorAll(".layer-thumbnail").length,
+            folderCount: document.querySelectorAll(".layer-folder-toggle").length,
             folderThumbnailCount: document.querySelectorAll(
               ".layer-group-row .layer-thumbnail",
             ).length,
@@ -149,12 +161,33 @@ function attachElectronSmoke({
         ) {
           throw new Error(`Layer panel failed: ${JSON.stringify(layers)}`);
         }
+        if (layers.folderCount) {
+          const folderToggle = await mainWindow.webContents.executeJavaScript(`(() => {
+            const button = document.querySelector(".layer-folder-toggle");
+            const before = document.querySelectorAll(".layer-row").length;
+            button.click();
+            const collapsed = document.querySelector(".layer-folder-toggle")
+              ?.getAttribute("aria-expanded") === "false";
+            const after = document.querySelectorAll(".layer-row").length;
+            document.querySelector(".layer-folder-toggle")?.click();
+            const restored = document.querySelectorAll(".layer-row").length;
+            return { before, after, restored, collapsed };
+          })()`);
+          if (
+            !folderToggle.collapsed ||
+            folderToggle.after >= folderToggle.before ||
+            folderToggle.restored !== folderToggle.before
+          ) {
+            throw new Error(`Layer folder toggle failed: ${JSON.stringify(folderToggle)}`);
+          }
+        }
         if (layers.thumbnailCount) {
           let thumbnailsReady = false;
           for (let attempt = 0; attempt < 100; attempt += 1) {
             await wait(100);
             thumbnailsReady = await mainWindow.webContents.executeJavaScript(`(() => (
-              document.querySelector(".layer-thumbnail")?.naturalWidth > 0
+              [...document.querySelectorAll(".layer-thumbnail")]
+                .some((thumbnail) => thumbnail.naturalWidth > 0)
             ))()`);
             if (thumbnailsReady) break;
           }

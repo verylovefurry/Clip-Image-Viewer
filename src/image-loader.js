@@ -7,8 +7,12 @@ const {
   decodeClipLayerForCanvas,
   decodeClipMaskForCanvas,
   decodeClipVector,
+  extractClipBorderSources,
+  extractClipBrushStyles,
   extractClipMaskSources,
+  extractClipObjectSources,
   extractClipRasterSources,
+  extractClipThumbnailSources,
   extractClipVectorSources,
 } = require("./clip-layer-reader");
 const {
@@ -58,6 +62,10 @@ const LAYERED_RENDER_CACHE_LIMIT = 12;
 const psdLeafCompositeCache = new WeakMap();
 const clipLayerDecodeCache = new Map();
 const CLIP_LAYER_DECODE_CACHE_LIMIT = 12;
+const clipFallbackDecodeCache = new Map();
+const CLIP_FALLBACK_DECODE_CACHE_LIMIT = 24;
+const clipObjectDecodeCache = new Map();
+const CLIP_OBJECT_DECODE_CACHE_LIMIT = 12;
 const clipVectorDecodeCache = new Map();
 const CLIP_VECTOR_DECODE_CACHE_LIMIT = 32;
 const clipMaskDecodeCache = new Map();
@@ -70,6 +78,8 @@ const MAX_ARCHIVE_TOTAL_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 10000;
 const MAX_IMAGE_PIXELS = 300 * 1000 * 1000;
 const MAX_CLIP_DATABASE_BYTES = 1536 * 1024 * 1024;
+const MAX_VECTOR_RENDER_PIXELS = 16 * 1024 * 1024;
+const MAX_VECTOR_STAMPS = 300000;
 
 const PSD_BLEND_LABELS = {
   "pass through": "통과",
@@ -535,13 +545,37 @@ function canvasCrop(row) {
 
 function clipBlendMode(value) {
   const numeric = numberOrZero(value);
-  const labels = [
-    "표준", "어둡게", "곱하기", "색상 번", "선형 번", "빼기",
-    "밝게", "스크린", "색상 닷지", "발광 닷지", "더하기", "더하기(발광)",
-    "오버레이", "소프트 라이트", "하드 라이트", "차이", "선명한 라이트",
-    "선형 라이트", "핀 라이트", "하드 혼합", "제외", "어두운 색상",
-    "밝은 색상", "나누기", "색조", "채도", "색상", "명도",
-  ];
+  const labels = {
+    0: "표준",
+    1: "비교(어둡게)",
+    2: "곱하기",
+    3: "색상 번",
+    4: "선형 번",
+    5: "빼기",
+    6: "어두운 색상",
+    7: "비교(밝게)",
+    8: "스크린",
+    9: "색상 닷지",
+    10: "발광 닷지",
+    11: "더하기",
+    12: "더하기(발광)",
+    13: "밝은 색상",
+    14: "오버레이",
+    15: "소프트 라이트",
+    16: "하드 라이트",
+    17: "선명한 라이트",
+    18: "선형 라이트",
+    19: "핀 라이트",
+    20: "하드 혼합",
+    21: "차이",
+    22: "제외",
+    23: "색조",
+    24: "채도",
+    25: "색상",
+    26: "명도",
+    30: "통과",
+    36: "나누기",
+  };
   return {
     value: numeric === 0 ? "normal" : `clip-${numeric}`,
     label: labels[numeric] || `CLIP 합성 모드 ${numeric}`,
@@ -549,12 +583,21 @@ function clipBlendMode(value) {
 }
 
 function clipLayerType(row, hasChildren, hintedType = "") {
-  if (hasChildren) return "group";
-  if (numberOrZero(row.TextLayerType) || row.TextLayerString?.length) return "text";
+  if (hasChildren || numberOrZero(row.LayerFolder)) return "group";
+  if (
+    row.TextLayerType !== null && row.TextLayerType !== undefined ||
+    row.TextLayerString?.length ||
+    row.TextLayerStringArray?.length ||
+    row.TextLayerAttributes?.length ||
+    row.TextLayerAttributesArray?.length
+  ) return "text";
   if (numberOrZero(row.LayerType) === 1) return "raster";
   if (numberOrZero(row.LayerType) === 1584) return "paper";
   if (row.GradationFillInfo?.length) return "gradient";
   if (hintedType) return hintedType;
+  if (numberOrZero(row.ComicFrameLineMipmap)) return "border";
+  if (numberOrZero(row.ResizableOriginalMipmap)) return "object";
+  if ([2, 3].includes(numberOrZero(row.LayerType))) return "object";
   if (
     numberOrZero(row.LayerEffectAttached) ||
     row.FilterLayerInfo?.length ||
@@ -565,8 +608,6 @@ function clipLayerType(row, hasChildren, hintedType = "") {
   const types = {
     800: "special",
   };
-  if (numberOrZero(row.ComicFrameLineMipmap)) return "border";
-  if (numberOrZero(row.ResizableOriginalMipmap)) return "vector";
   return types[numberOrZero(row.LayerType)] || "layer";
 }
 
@@ -631,30 +672,227 @@ function extractClipLayerTypeHints(db) {
 
 function decodeClipText(value) {
   if (!value?.length) return "";
-  return Buffer.from(value).toString("utf8").replace(/\0/g, "").trim();
+  return Buffer.from(value).toString("utf8").replace(/\0/g, "");
+}
+
+function clipTextColor(data, offset, bytes = 4) {
+  const read = bytes === 2
+    ? (delta) => data.readUInt16LE(offset + delta) >>> 8
+    : (delta) => clipColorChannel(data.readUInt32LE(offset + delta));
+  return [0, bytes, bytes * 2].map(read);
+}
+
+function parseClipTextRangeList(data, readValue) {
+  if (data.length < 4) return [];
+  const count = data.readInt32LE(0);
+  if (count < 0 || count > 100000) return [];
+  const ranges = [];
+  let offset = 4;
+  for (let index = 0; index < count; index += 1) {
+    if (offset + 12 > data.length) break;
+    const start = data.readUInt32LE(offset);
+    const length = data.readInt32LE(offset + 4);
+    const valueLength = data.readInt32LE(offset + 8);
+    offset += 12;
+    if (length < 0 || valueLength < 0 || offset + valueLength > data.length) break;
+    const value = readValue(data, offset, valueLength);
+    if (value !== undefined) ranges.push({ start, length, ...value });
+    offset += valueLength;
+  }
+  return ranges;
+}
+
+function parseClipTextRuns(data) {
+  if (data.length < 4) return [];
+  const count = data.readInt32LE(0);
+  if (count < 0 || count > 100000) return [];
+  const runs = [];
+  let offset = 4;
+  for (let index = 0; index < count; index += 1) {
+    if (offset + 28 > data.length) break;
+    const start = data.readUInt32LE(offset);
+    const length = data.readInt32LE(offset + 4);
+    const entryLength = data.readInt32LE(offset + 8);
+    const style = data.readUInt8(offset + 12);
+    const defaultStyle = data.readUInt8(offset + 13);
+    const color = clipTextColor(data, offset + 14, 2);
+    const fontScale = data.readDoubleLE(offset + 20);
+    offset += 28;
+    let font = "";
+    if (offset + 2 <= data.length) {
+      const fontLength = data.readUInt16LE(offset);
+      const fontBytes = fontLength * 2;
+      if (fontLength < 4096 && offset + 2 + fontBytes <= data.length) {
+        offset += 2;
+        font = data.subarray(offset, offset + fontBytes).toString("utf16le");
+        offset += fontBytes;
+      }
+    }
+    runs.push({ start, length, entryLength, style, defaultStyle, color, fontScale, font });
+  }
+  return runs;
+}
+
+function parseClipFontList(data) {
+  if (data.length < 2) return [];
+  const count = data.readUInt16LE(0);
+  const fonts = [];
+  let offset = 2;
+  for (let index = 0; index < count; index += 1) {
+    if (offset + 2 > data.length) break;
+    const displayLength = data.readUInt16LE(offset);
+    offset += 2;
+    if (offset + displayLength > data.length) break;
+    const display = data.subarray(offset, offset + displayLength).toString("utf8");
+    offset += displayLength;
+    if (offset + 2 > data.length) break;
+    const internalLength = data.readUInt16LE(offset);
+    offset += 2;
+    if (offset + internalLength > data.length) break;
+    const internal = data.subarray(offset, offset + internalLength).toString("utf8");
+    offset += internalLength;
+    fonts.push({ display, internal });
+  }
+  return fonts;
 }
 
 function parseClipTextAttributes(value) {
   const data = value?.length ? Buffer.from(value) : null;
   if (!data) return null;
-  const result = {};
+  const result = {
+    runs: [],
+    alignRuns: [],
+    lineSpacingRuns: [],
+    characterSpacingRuns: [],
+    outlineRuns: [],
+  };
   let offset = 0;
   while (offset + 8 <= data.length) {
     const id = data.readUInt32LE(offset);
     const length = data.readUInt32LE(offset + 4);
     offset += 8;
     if (length > data.length - offset) break;
-    if (id === 31) result.font = data.subarray(offset, offset + length).toString("utf8");
-    if (id === 32 && length >= 4) result.fontSize = data.readUInt32LE(offset);
-    if (id === 34 && length >= 12) {
-      result.color = [0, 4, 8].map((delta) => data.readUInt32LE(offset + delta));
+    const section = data.subarray(offset, offset + length);
+    if (id === 11) result.runs = parseClipTextRuns(section);
+    if (id === 12) {
+      result.alignRuns = parseClipTextRangeList(section, (entry, start, size) => (
+        size >= 2 ? { align: entry.readInt16LE(start) } : undefined
+      ));
     }
+    if (id === 13) {
+      result.lineSpacingRuns = parseClipTextRangeList(section, (entry, start, size) => (
+        size >= 18 ? {
+          absolute: Boolean(entry.readInt16LE(start)),
+          relativeSpacing: entry.readDoubleLE(start + 2),
+          absoluteSpacing: entry.readDoubleLE(start + 10),
+        } : undefined
+      ));
+    }
+    if (id === 14) {
+      result.characterSpacingRuns = parseClipTextRangeList(section, (entry, start, size) => (
+        size >= 8 ? { characterSpacing: entry.readDoubleLE(start) } : undefined
+      ));
+    }
+    if (id === 18) {
+      result.outlineRuns = parseClipTextRangeList(section, (entry, start, size) => (
+        size >= 2 ? { outline: entry.readInt16LE(start) } : undefined
+      ));
+    }
+    if (id === 26) {
+      result.aspectRatioRuns = parseClipTextRangeList(section, (entry, start, size) => (
+        size >= 16 ? {
+          aspectRatio: [entry.readDoubleLE(start), entry.readDoubleLE(start + 8)],
+        } : undefined
+      ));
+    }
+    if (id === 31) result.font = section.toString("utf8");
+    if (id === 32 && length >= 4) result.fontSize = section.readUInt32LE(0);
+    if (id === 33 && length >= 4) {
+      result.style = section.readUInt32LE(0);
+      result.vertical = Boolean(result.style & 16);
+    }
+    if (id === 34 && length >= 12) result.color = clipTextColor(section, 0);
+    if (id === 35 && length >= 4) result.align = section.readInt32LE(0);
+    if (id === 38 && length >= 4) result.horizontalInVertical = section.readInt32LE(0);
     if (id === 42 && length >= 16) {
-      result.bounds = [0, 4, 8, 12].map((delta) => data.readInt32LE(offset + delta));
+      result.bounds = [0, 4, 8, 12].map((delta) => section.readInt32LE(delta));
+    }
+    if (id === 48 && length >= 4) result.antiAliasing = section.readInt32LE(0);
+    if (id === 52 && length >= 4) result.halfWidthPunctuation = Boolean(section.readInt32LE(0));
+    if (id === 53 && length >= 4) result.wrapFrame = Boolean(section.readInt32LE(0));
+    if (id === 54 && length >= 20) {
+      result.background = {
+        enabled: Boolean(section.readInt32LE(0)),
+        color: clipTextColor(section, 4),
+        opacity: clipColorChannel(section.readUInt32LE(16)),
+      };
+    }
+    if (id === 55 && length >= 4) result.wrapDirection = section.readInt32LE(0);
+    if (id === 56 && length >= 24) {
+      result.edge = {
+        enabled: Boolean(section.readInt32LE(0)),
+        width: section.readInt32LE(4) / 1000,
+        color: clipTextColor(section, 12),
+      };
+    }
+    if (id === 57) result.fonts = parseClipFontList(section);
+    if (id === 58 && length >= 4) result.rotation = section.readInt32LE(0) / 10 - 180;
+    if (id === 59 && length >= 4) result.skewX = section.readInt32LE(0) / 10 - 90;
+    if (id === 60 && length >= 4) result.skewY = section.readInt32LE(0) / 10 - 90;
+    if (id === 63 && length >= 8) {
+      result.boxSize = [section.readInt32LE(0), section.readInt32LE(4)];
+    }
+    if (id === 64 && length >= 32) {
+      result.quad = Array.from({ length: 8 }, (_, index) => (
+        section.readInt32LE(index * 4) / 100
+      ));
     }
     offset += length;
   }
   return Object.keys(result).length ? result : null;
+}
+
+function parseClipLengthPrefixedArray(value) {
+  const data = value?.length ? Buffer.from(value) : null;
+  if (!data) return [];
+  const entries = [];
+  let offset = 0;
+  while (offset < data.length) {
+    if (offset + 4 > data.length) return [];
+    const length = data.readUInt32LE(offset);
+    offset += 4;
+    if (length > data.length - offset) return [];
+    entries.push(data.subarray(offset, offset + length));
+    offset += length;
+  }
+  return entries;
+}
+
+function parseClipTextObjects(row) {
+  const strings = parseClipLengthPrefixedArray(row.TextLayerStringArray);
+  const attributes = parseClipLengthPrefixedArray(row.TextLayerAttributesArray);
+  const extended = parseClipLengthPrefixedArray(row.TextLayerAddAttributesV01);
+  const hasPrimary = row.TextLayerType !== null && row.TextLayerType !== undefined ||
+    row.TextLayerString?.length || row.TextLayerAttributes?.length;
+  const objects = [];
+  if (hasPrimary) {
+    objects.push({
+      index: 0,
+      text: decodeClipText(row.TextLayerString),
+      attributes: parseClipTextAttributes(row.TextLayerAttributes),
+      extendedAttributes: parseClipTextAttributes(extended[0]),
+    });
+  }
+  const count = Math.max(strings.length, attributes.length);
+  for (let index = 0; index < count; index += 1) {
+    objects.push({
+      index: objects.length,
+      text: decodeClipText(strings[index]),
+      attributes: parseClipTextAttributes(attributes[index]),
+      extendedAttributes: parseClipTextAttributes(extended[index + 1]),
+    });
+  }
+  return objects;
 }
 
 function parseClipGradient(value) {
@@ -753,15 +991,87 @@ function parseClipGradient(value) {
   return null;
 }
 
+function parseClipResizableImage(value) {
+  const data = value?.length ? Buffer.from(value) : null;
+  if (!data || data.length < 184) return null;
+  try {
+    const sourceWidth = data.readUInt32BE(32);
+    const sourceHeight = data.readUInt32BE(36);
+    const corners = [
+      { x: data.readDoubleBE(120), y: data.readDoubleBE(128) },
+      { x: data.readDoubleBE(136), y: data.readDoubleBE(144) },
+      { x: data.readDoubleBE(152), y: data.readDoubleBE(160) },
+      { x: data.readDoubleBE(168), y: data.readDoubleBE(176) },
+    ];
+    if (
+      !sourceWidth ||
+      !sourceHeight ||
+      sourceWidth > 100000 ||
+      sourceHeight > 100000 ||
+      corners.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))
+    ) return null;
+    return { sourceWidth, sourceHeight, corners };
+  } catch {
+    return null;
+  }
+}
+
 function clipColorChannel(value) {
   const numeric = numberOrZero(value);
   return Math.max(0, Math.min(255, Math.round(numeric / 0xffffffff * 255)));
 }
 
+function parseClipEdgeEffect(value) {
+  const data = value?.length ? Buffer.from(value) : null;
+  if (!data) return null;
+  const name = Buffer.from("EffectEdge", "utf16le").swap16();
+  const nameOffset = data.indexOf(name);
+  const valueOffset = nameOffset + name.length;
+  if (nameOffset < 4 || valueOffset + 24 > data.length) return null;
+  try {
+    const enabled = data.readUInt32BE(valueOffset) !== 0;
+    const width = data.readDoubleBE(valueOffset + 4);
+    const color = [12, 16, 20].map((offset) => (
+      clipColorChannel(data.readUInt32BE(valueOffset + offset))
+    ));
+    if (!enabled || !Number.isFinite(width) || width <= 0 || width > 10000) return null;
+    return { width, color };
+  } catch {
+    return null;
+  }
+}
+
+function parseClipToneEffect(value) {
+  const data = value?.length ? Buffer.from(value) : null;
+  if (!data) return null;
+  const name = Buffer.from("EffectTone", "utf16le").swap16();
+  const nameOffset = data.indexOf(name);
+  const valueOffset = nameOffset + name.length;
+  if (nameOffset < 4 || valueOffset + 48 > data.length) return null;
+  try {
+    const enabled = data.readUInt32BE(valueOffset) !== 0;
+    const resolution = data.readDoubleBE(valueOffset + 4);
+    const frequency = data.readDoubleBE(valueOffset + 24);
+    const angle = data.readUInt32BE(valueOffset + 40);
+    if (
+      !enabled ||
+      !Number.isFinite(resolution) ||
+      !Number.isFinite(frequency) ||
+      frequency <= 0 ||
+      frequency > 1000
+    ) return null;
+    return { resolution, frequency, angle };
+  } catch {
+    return null;
+  }
+}
+
 function clipLayerEffects(row) {
   const effects = [];
   if (numberOrZero(row.LayerEffectAttached) || row.LayerEffectInfo?.length) {
-    effects.push("테두리/레이어 효과");
+    if (parseClipEdgeEffect(row.LayerEffectInfo)) effects.push("테두리");
+    if (parseClipToneEffect(row.LayerEffectInfo)) effects.push("톤");
+    if (!effects.length) effects.push("레이어 효과");
   }
   const filterData = row.FilterLayerInfo?.length
     ? Buffer.from(row.FilterLayerInfo)
@@ -787,6 +1097,8 @@ function clipLayerEffects(row) {
 function clipLayerDefinition(row, nested, hintedType = "") {
   const blend = clipBlendMode(row.LayerComposite);
   const type = clipLayerType(row, nested.length > 0, hintedType);
+  const visibilityFlags = numberOrZero(row.LayerVisibility);
+  const textObjects = type === "text" ? parseClipTextObjects(row) : [];
   const drawColor = [
     clipColorChannel(row.DrawColorMainRed),
     clipColorChannel(row.DrawColorMainGreen),
@@ -800,6 +1112,7 @@ function clipLayerDefinition(row, nested, hintedType = "") {
       group: "그룹",
       raster: "래스터",
       vector: "벡터/오브젝트",
+      object: "오브젝트/소재",
       text: "텍스트",
       border: "테두리",
       tone: "톤",
@@ -810,7 +1123,13 @@ function clipLayerDefinition(row, nested, hintedType = "") {
       special: "CSP 전용",
       layer: "CSP 레이어",
     }[type] || type,
-    visible: numberOrZero(row.LayerVisibility) !== 0,
+    layerTypeCode: numberOrZero(row.LayerType),
+    folderKind: numberOrZero(row.LayerFolder),
+    visible: Boolean(visibilityFlags & 1),
+    maskVisible: Boolean(visibilityFlags & 2),
+    rulerVisible: Boolean(visibilityFlags & 4),
+    locked: numberOrZero(row.LayerLock) !== 0,
+    draft: numberOrZero(row.DraftLayer) !== 0,
     opacity: Math.round(Math.max(0, Math.min(1, numberOrZero(row.LayerOpacity) / 256)) * 100),
     blendMode: blend.value,
     blendModeLabel: blend.label,
@@ -820,10 +1139,28 @@ function clipLayerDefinition(row, nested, hintedType = "") {
       numberOrZero(row.LayerLayerMaskThumbnail),
     ),
     effects: clipLayerEffects(row),
-    textPreview: decodeClipText(row.TextLayerString),
-    textAttributes: parseClipTextAttributes(row.TextLayerAttributes),
+    edgeEffect: parseClipEdgeEffect(row.LayerEffectInfo),
+    toneEffect: parseClipToneEffect(row.LayerEffectInfo),
+    textPreview: textObjects[0]?.text || "",
+    textAttributes: textObjects[0]?.attributes || null,
+    textObjectCount: textObjects.length,
+    textObjects,
     gradient: parseClipGradient(row.GradationFillInfo),
+    resizable: parseClipResizableImage(row.ResizableImageInfo),
     drawColor,
+    colorMode: {
+      index: numberOrZero(row.LayerColorTypeIndex),
+      black: numberOrZero(row.LayerColorTypeBlackChecked) !== 0,
+      white: numberOrZero(row.LayerColorTypeWhiteChecked) !== 0,
+    },
+    offsetX: numberOrZero(row.LayerOffsetX),
+    offsetY: numberOrZero(row.LayerOffsetY),
+    renderOffsetX: numberOrZero(row.LayerRenderOffscrOffsetX),
+    renderOffsetY: numberOrZero(row.LayerRenderOffscrOffsetY),
+    maskOffsetX: numberOrZero(row.LayerMaskOffsetX),
+    maskOffsetY: numberOrZero(row.LayerMaskOffsetY),
+    maskRenderOffsetX: numberOrZero(row.LayerMaskOffscrOffsetX),
+    maskRenderOffsetY: numberOrZero(row.LayerMaskOffscrOffsetY),
     paperColor: type === "paper" ? drawColor : null,
     children: nested,
   };
@@ -899,42 +1236,65 @@ function extractClipLayerDocument(db, canvasRow) {
   };
 }
 
-function applyClipLayerAvailability(layerDocument, rasterSources, vectorSources) {
+function applyClipLayerAvailability(
+  layerDocument,
+  rasterSources,
+  vectorSources,
+  objectSources,
+  borderSources,
+  thumbnailSources,
+) {
   if (!layerDocument) return;
   let available = 0;
   let toggleable = 0;
   const visit = (layers) => {
     for (const layer of layers || []) {
+      layer.rasterAvailable = Boolean(rasterSources[layer.id]?.length);
+      layer.vectorAvailable = Boolean(vectorSources[layer.id]?.length);
+      layer.objectRasterAvailable = Boolean(objectSources[layer.id]?.length);
+      layer.borderRasterAvailable = Boolean(borderSources[layer.id]?.length);
+      layer.thumbnailAvailable = Boolean(thumbnailSources[layer.id]?.length);
+      layer.ownToggleAvailable = layer.rasterAvailable ||
+        layer.vectorAvailable ||
+        layer.objectRasterAvailable ||
+        layer.borderRasterAvailable ||
+        layer.thumbnailAvailable ||
+        layer.type === "paper" ||
+        layer.type === "text" ||
+        Boolean(layer.gradient);
       if (layer.type !== "group" && !layer.children?.length) {
-        layer.rasterAvailable = Boolean(rasterSources[layer.id]?.length);
-        layer.vectorAvailable = Boolean(vectorSources[layer.id]?.length);
-        layer.thumbnailAvailable = true;
-        layer.toggleAvailable = layer.rasterAvailable ||
-          layer.vectorAvailable ||
-          layer.type === "paper" ||
-          layer.type === "text" ||
-          Boolean(layer.gradient);
+        layer.toggleAvailable = layer.ownToggleAvailable;
         layer.previewAccuracy = layer.rasterAvailable
           ? layer.visible && layer.effects?.length
-            ? "원본 합성 문맥 래스터(정확)"
+            ? layer.edgeEffect
+              ? "저장 레이어 래스터 + 테두리 재구성"
+              : "저장 레이어 래스터(효과 근사)"
             : "저장 레이어 래스터(정확)"
-          : layer.visible && (layer.vectorAvailable || layer.type === "text")
-            ? "원본 합성 문맥 래스터(정확)"
-            : layer.vectorAvailable
+          : layer.vectorAvailable
               ? "벡터 경로 재구성(근사)"
+            : layer.objectRasterAvailable && layer.resizable
+              ? "CSP 오브젝트 원본 + 아핀 변환"
+            : layer.type === "text"
+              ? "텍스트 객체 재구성(근사)"
             : layer.type === "paper"
               ? "용지 색상"
-              : layer.gradient
-                ? "그레이디언트 재구성(근사)"
-                : layer.visible
-                  ? "원본 합성 문맥 래스터(정확)"
-                  : "레이어 메타데이터";
-        available += 1;
+            : layer.gradient
+              ? "그레이디언트 재구성(근사)"
+              : layer.thumbnailAvailable
+                ? "저장 레이어 썸네일(저해상도)"
+                : "레이어 메타데이터";
+        if (layer.thumbnailAvailable || layer.ownToggleAvailable) available += 1;
         if (layer.toggleAvailable) toggleable += 1;
       }
       visit(layer.children);
       if (layer.type === "group" || layer.children?.length) {
-        layer.toggleAvailable = layer.children.some((child) => child.toggleAvailable);
+        layer.toggleAvailable = layer.ownToggleAvailable ||
+          layer.children.some((child) => child.toggleAvailable);
+        layer.previewAccuracy = layer.ownToggleAvailable
+          ? layer.vectorAvailable
+            ? "폴더 자체 벡터 + 하위 레이어 합성"
+            : "폴더 자체 데이터 + 하위 레이어 합성"
+          : "하위 레이어 합성";
       }
     }
   };
@@ -942,7 +1302,7 @@ function applyClipLayerAvailability(layerDocument, rasterSources, vectorSources)
   layerDocument.thumbnailSupported = available > 0;
   layerDocument.toggleSupported = toggleable > 0;
   layerDocument.note = toggleable
-    ? "레이어 목록은 원본 구조를 유지하며, CSP 전용 표현은 저장된 합성본에서 비파괴 문맥 래스터로 표시합니다. ON/OFF 재합성은 지원 데이터 범위에서 처리합니다."
+    ? "레이어·폴더·텍스트 객체 구조를 유지합니다. 저장 래스터는 직접 합성하고, CSP 전용 표현은 벡터·메타데이터 또는 저장 레이어 썸네일로 비파괴 재구성합니다."
     : "레이어 구조와 종류별 미리보기만 제공합니다. 이 파일에는 독립 합성 가능한 레이어 데이터가 없습니다.";
 }
 
@@ -987,10 +1347,21 @@ async function extractClipData(input) {
         tableStatement.free();
       }
       const layerDocument = extractClipLayerDocument(db, canvasRow);
+      const brushStyles = extractClipBrushStyles(db);
       const rasterSources = extractClipRasterSources(db);
+      const thumbnailSources = extractClipThumbnailSources(db);
       const maskSources = extractClipMaskSources(db);
       const vectorSources = extractClipVectorSources(db);
-      applyClipLayerAvailability(layerDocument, rasterSources, vectorSources);
+      const objectSources = extractClipObjectSources(db);
+      const borderSources = extractClipBorderSources(db);
+      applyClipLayerAvailability(
+        layerDocument,
+        rasterSources,
+        vectorSources,
+        objectSources,
+        borderSources,
+        thumbnailSources,
+      );
       const preview = Buffer.from(image);
       const previewMetadata = await imageMetadata(preview);
       const rasterLevels = Object.values(rasterSources).flat();
@@ -1002,16 +1373,33 @@ async function extractClipData(input) {
       if (layerDocument) {
         layerDocument.width = previewMetadata.width || largestLevel?.width || 0;
         layerDocument.height = previewMetadata.height || largestLevel?.height || 0;
-        layerDocument.nativeWidth = largestLevel?.width || layerDocument.width;
-        layerDocument.nativeHeight = largestLevel?.height || layerDocument.height;
+        const resolution = numberOrZero(canvasRow?.CanvasResolution) || 72;
+        const physicalWidth = Math.round(numberOrZero(canvasRow?.CanvasWidth) / 25.4 * resolution);
+        const physicalHeight = Math.round(numberOrZero(canvasRow?.CanvasHeight) / 25.4 * resolution);
+        const previewRatio = layerDocument.width / Math.max(1, layerDocument.height);
+        const physicalRatio = physicalWidth / Math.max(1, physicalHeight);
+        const physicalCanvasAvailable = Number(canvasRow?.CanvasUnit) === 2 &&
+          physicalWidth > 0 &&
+          physicalHeight > 0 &&
+          Math.abs(previewRatio - physicalRatio) <= Math.max(0.02, previewRatio * 0.03);
+        layerDocument.nativeWidth = physicalCanvasAvailable
+          ? physicalWidth
+          : largestLevel?.width || layerDocument.width;
+        layerDocument.nativeHeight = physicalCanvasAvailable
+          ? physicalHeight
+          : largestLevel?.height || layerDocument.height;
       }
       return {
         preview,
         crop,
         layerDocument,
         rasterSources,
+        thumbnailSources,
         maskSources,
         vectorSources,
+        objectSources,
+        borderSources,
+        brushStyles,
         source: input,
       };
     } finally {
@@ -1450,6 +1838,7 @@ function cachedClipVector(item, clip, layer) {
     clip.vectorSources?.[layer.id] || [],
     clip.layerDocument.nativeWidth,
     clip.layerDocument.nativeHeight,
+    clip.brushStyles,
   );
   clipVectorDecodeCache.set(key, decoded);
   while (clipVectorDecodeCache.size > CLIP_VECTOR_DECODE_CACHE_LIMIT) {
@@ -1469,8 +1858,22 @@ function clipVectorSvg(
 ) {
   const bounds = decoded.bounds;
   const padding = thumbnail ? 5 : 0;
-  const sourceWidth = Math.max(1, bounds.right - bounds.left);
-  const sourceHeight = Math.max(1, bounds.bottom - bounds.top);
+  const frameVector = layer.type === "group" && layer.vectorAvailable;
+  const frameWidth = frameVector ? 10 : 0;
+  const segments = frameVector
+    ? decoded.segments.map((segment) => (
+        segment.length >= 3 ? [...segment, segment[0]] : segment
+      ))
+    : decoded.segments;
+  const pointWidth = (point) => (
+    frameVector && point.width < 0.05 ? frameWidth : point.width
+  );
+  const edgeWidth = Math.max(0, Number(layer.edgeEffect?.width) || 0);
+  const geometryPadding = Math.max(edgeWidth, frameWidth / 2);
+  const sourceLeft = bounds.left - geometryPadding;
+  const sourceTop = bounds.top - geometryPadding;
+  const sourceWidth = Math.max(1, bounds.right - bounds.left + geometryPadding * 2);
+  const sourceHeight = Math.max(1, bounds.bottom - bounds.top + geometryPadding * 2);
   const scale = thumbnail
     ? Math.min((width - padding * 2) / sourceWidth, (height - padding * 2) / sourceHeight)
     : Math.min(
@@ -1478,42 +1881,163 @@ function clipVectorSvg(
         height / Math.max(1, nativeHeight),
       );
   const offsetX = thumbnail
-    ? (width - sourceWidth * scale) / 2 - bounds.left * scale
+    ? (width - sourceWidth * scale) / 2 - sourceLeft * scale
     : 0;
   const offsetY = thumbnail
-    ? (height - sourceHeight * scale) / 2 - bounds.top * scale
+    ? (height - sourceHeight * scale) / 2 - sourceTop * scale
     : 0;
-  const color = layer.drawColor?.some((channel) => channel > 0)
-    ? layer.drawColor
+  const color = Array.isArray(layer.drawColor) && layer.drawColor.length >= 3
+    ? layer.drawColor.slice(0, 3).map((channel) => (
+        Math.max(0, Math.min(255, Math.round(Number(channel) || 0)))
+      ))
     : [28, 32, 38];
-  const thumbnailBackground =
-    (color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114) > 210
-      ? "#343a45"
-      : "#f3f5f8";
-  const paths = decoded.segments.map((segment) => {
-    const points = segment.map((point) => (
-      `${point.x * scale + offsetX},${point.y * scale + offsetY}`
-    )).join(" ");
-    const widthValues = segment.map((point) => point.width).sort((a, b) => a - b);
-    const strokeWidth = Math.max(
-      thumbnail ? 1.2 : 0.5,
-      widthValues[Math.floor(widthValues.length / 2)] * scale,
+  const stamps = [];
+  const pairStepCount = (previous, point) => {
+    const distance = Math.hypot(point.x - previous.x, point.y - previous.y) * scale;
+    const minimumThickness = Math.min(
+      pointWidth(previous) * previous.thickness,
+      pointWidth(point) * point.thickness,
+    ) * scale;
+    const spacing = Math.max(0.25, Math.min(1, minimumThickness * 0.4));
+    return Math.max(1, Math.ceil(distance / spacing));
+  };
+  let desiredStampCount = segments.length;
+  for (const segment of segments) {
+    for (let index = 1; index < segment.length; index += 1) {
+      desiredStampCount += pairStepCount(segment[index - 1], segment[index]);
+    }
+  }
+  const stampReduction = Math.max(1, desiredStampCount / MAX_VECTOR_STAMPS);
+  const appendStamp = (previous, point, ratio) => {
+    const x = (previous.x + (point.x - previous.x) * ratio) * scale + offsetX;
+    const y = (previous.y + (point.y - previous.y) * ratio) * scale + offsetY;
+    const brushWidth = Math.max(
+      0.01,
+      pointWidth(previous) + (pointWidth(point) - pointWidth(previous)) * ratio,
+    ) * scale;
+    const thickness = Math.max(
+      0.01,
+      Math.min(1, previous.thickness +
+        (point.thickness - previous.thickness) * ratio),
     );
-    const outline = layer.effects?.length
-      ? `<polyline points="${points}" fill="none" stroke="#ffffff"
-          stroke-width="${strokeWidth + Math.max(1.5, scale * 3)}"
-          stroke-linecap="round" stroke-linejoin="round"/>`
-      : "";
-    return `${outline}<polyline points="${points}" fill="none"
-      stroke="rgb(${color.join(",")})" stroke-width="${strokeWidth}"
-      stroke-linecap="round" stroke-linejoin="round"/>`;
-  }).join("");
+    let rotationDelta = (point.rotation - previous.rotation) % 360;
+    if (rotationDelta > 180) rotationDelta -= 360;
+    if (rotationDelta < -180) rotationDelta += 360;
+    const rotation = previous.rotation + rotationDelta * ratio;
+    const radiusX = Math.max(0.005, brushWidth / 2);
+    const radiusY = Math.max(0.005, radiusX * thickness);
+    stamps.push(`<ellipse cx="${x}" cy="${y}" rx="${radiusX}" ry="${radiusY}"
+      transform="rotate(${rotation} ${x} ${y})"/>`);
+  };
+  for (const segment of segments) {
+    if (!segment.length) continue;
+    if (segment.length === 1) {
+      appendStamp(segment[0], segment[0], 0);
+      continue;
+    }
+    appendStamp(segment[0], segment[0], 0);
+    for (let index = 1; index < segment.length; index += 1) {
+      const previous = segment[index - 1];
+      const point = segment[index];
+      const steps = Math.max(1, Math.ceil(
+        pairStepCount(previous, point) / stampReduction,
+      ));
+      for (let step = 1; step <= steps; step += 1) {
+        appendStamp(previous, point, step / steps);
+      }
+    }
+  }
+  const geometry = stamps.join("");
+  const edgeColor = layer.edgeEffect?.color || [255, 255, 255];
+  const edge = edgeWidth > 0
+    ? `<use href="#clip-vector-stamps" fill="rgb(${edgeColor.join(",")})"
+        stroke="rgb(${edgeColor.join(",")})"
+        stroke-width="${edgeWidth * scale * 2}" stroke-linejoin="round"/>`
+    : "";
   return Buffer.from(`
     <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
-      ${thumbnail ? `<rect width="${width}" height="${height}" fill="${thumbnailBackground}"/>` : ""}
-      ${paths}
+      <defs><g id="clip-vector-stamps">${geometry}</g></defs>
+      ${edge}
+      <use href="#clip-vector-stamps" fill="rgb(${color.join(",")})"/>
     </svg>
   `);
+}
+
+function clipFrameMaskSvg(decoded, width, height, nativeWidth, nativeHeight) {
+  const scaleX = width / Math.max(1, nativeWidth || width);
+  const scaleY = height / Math.max(1, nativeHeight || height);
+  const paths = (decoded?.segments || [])
+    .filter((segment) => segment.length >= 3)
+    .map((segment) => segment.map((point, index) => (
+      `${index ? "L" : "M"}${point.x * scaleX},${point.y * scaleY}`
+    )).join(" ") + " Z")
+    .join(" ");
+  if (!paths) return null;
+  return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+    <path d="${paths}" fill="#fff"/>
+  </svg>`);
+}
+
+async function applyClipFrameMask(input, decoded, width, height, layerDocument) {
+  const mask = clipFrameMaskSvg(
+    decoded,
+    width,
+    height,
+    layerDocument.nativeWidth,
+    layerDocument.nativeHeight,
+  );
+  if (!mask) return input;
+  return sharp(input)
+    .composite([{ input: mask, blend: "dest-in" }])
+    .png({ compressionLevel: 1 })
+    .toBuffer();
+}
+
+async function clipVectorPng(
+  layer,
+  decoded,
+  width,
+  height,
+  thumbnail = false,
+  nativeWidth = width,
+  nativeHeight = height,
+) {
+  const requestedScale = thumbnail ? 4 : 2;
+  const availableScale = Math.max(1, Math.floor(Math.sqrt(
+    MAX_VECTOR_RENDER_PIXELS / Math.max(1, width * height),
+  )));
+  const renderScale = Math.min(requestedScale, availableScale);
+  const renderWidth = width * renderScale;
+  const renderHeight = height * renderScale;
+  let output = await sharp(clipVectorSvg(
+    layer,
+    decoded,
+    renderWidth,
+    renderHeight,
+    thumbnail,
+    nativeWidth,
+    nativeHeight,
+  )).png({ compressionLevel: 1 }).toBuffer();
+  if (renderScale > 1) {
+    output = await sharp(output)
+      .resize(width, height, { kernel: "lanczos3" })
+      .png({ compressionLevel: 1 })
+      .toBuffer();
+  }
+  if (thumbnail) {
+    const color = Array.isArray(layer.drawColor) && layer.drawColor.length >= 3
+      ? layer.drawColor
+      : [28, 32, 38];
+    const background = (
+      color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
+    ) > 210
+      ? { r: 52, g: 58, b: 69, alpha: 1 }
+      : { r: 243, g: 245, b: 248, alpha: 1 };
+    output = await sharp({
+      create: { width, height, channels: 4, background },
+    }).composite([{ input: output }]).png({ compressionLevel: 7 }).toBuffer();
+  }
+  return output;
 }
 
 async function clipMetadataThumbnail(layer, size, preview) {
@@ -1703,19 +2227,22 @@ async function loadLayerThumbnail(item, id, size = 58) {
     const decoded = decodeClipLayer(
       clip.source,
       clip.rasterSources?.[String(id)] || [],
-      thumbnailSize,
+      thumbnailSize * 2,
+      { color: layer.drawColor },
+    ) || decodeClipLayer(
+      clip.source,
+      clip.objectSources?.[String(id)] || clip.borderSources?.[String(id)] || [],
+      thumbnailSize * 2,
+      { color: layer.drawColor },
     );
     const vector = !decoded && layer.vectorAvailable
       ? cachedClipVector(item, clip, layer)
       : null;
-    const contextRaster = layer.visible && Boolean(
-      vector ||
-      layer.type === "text" ||
-      layer.effects?.length ||
-      (!decoded && !layer.gradient && layer.type !== "paper"),
+    const reconstructable = Boolean(
+      layer.type === "text" || layer.gradient || layer.type === "paper",
     );
     let reconstructed = null;
-    if (!decoded && !vector && !contextRaster && layer.gradient) {
+    if (!decoded && !vector && reconstructable) {
       const documentWidth = Math.max(1, clip.layerDocument.width);
       const documentHeight = Math.max(1, clip.layerDocument.height);
       const scale = Math.min(1, 320 / Math.max(documentWidth, documentHeight));
@@ -1725,19 +2252,29 @@ async function loadLayerThumbnail(item, id, size = 58) {
         layer,
         Math.max(1, Math.round(documentWidth * scale)),
         Math.max(1, Math.round(documentHeight * scale)),
+        { allowThumbnailFallback: false },
       );
     }
-    const thumbnail = contextRaster
-      ? await contextRasterThumbnail(
-          clip.preview,
+    const hasIndependentSource = layer.rasterAvailable ||
+      layer.vectorAvailable ||
+      layer.objectRasterAvailable ||
+      layer.borderRasterAvailable ||
+      reconstructable;
+    const storedThumbnail = !decoded && !vector && !reconstructed && !hasIndependentSource
+      ? decodeClipLayer(
+          clip.source,
+          clip.thumbnailSources?.[String(id)] || [],
           thumbnailSize,
-          clipContextBounds(layer, vector),
-          clip.layerDocument.nativeWidth,
-          clip.layerDocument.nativeHeight,
         )
-      : decoded
-      ? await sharp(decoded.data, {
-          raw: { width: decoded.width, height: decoded.height, channels: 4 },
+      : null;
+    const decodedThumbnail = decoded || storedThumbnail;
+    const thumbnail = decodedThumbnail
+      ? await sharp(decodedThumbnail.data, {
+          raw: {
+            width: decodedThumbnail.width,
+            height: decodedThumbnail.height,
+            channels: 4,
+          },
         })
           .resize(thumbnailSize, thumbnailSize, {
             fit: "contain",
@@ -1746,9 +2283,7 @@ async function loadLayerThumbnail(item, id, size = 58) {
           .png({ compressionLevel: 7 })
           .toBuffer()
       : vector
-        ? await sharp(clipVectorSvg(layer, vector, thumbnailSize, thumbnailSize, true))
-            .png({ compressionLevel: 7 })
-            .toBuffer()
+        ? clipVectorPng(layer, vector, thumbnailSize, thumbnailSize, true)
         : reconstructed
           ? await sharp(reconstructed.input)
               .trim({ background: { r: 0, g: 0, b: 0, alpha: 0 } })
@@ -1758,7 +2293,7 @@ async function loadLayerThumbnail(item, id, size = 58) {
               })
               .png({ compressionLevel: 7 })
               .toBuffer()
-          : await clipMetadataThumbnail(layer, thumbnailSize, clip.preview);
+          : await clipMetadataThumbnail(layer, thumbnailSize, null);
     const dataUrl = `data:image/png;base64,${thumbnail.toString("base64")}`;
     layerThumbnailCache.set(cacheKey, dataUrl);
     while (layerThumbnailCache.size > LAYER_THUMBNAIL_CACHE_LIMIT) {
@@ -2006,15 +2541,19 @@ function clipBlendModeForSharp(value) {
     "clip-1": "darken",
     "clip-2": "multiply",
     "clip-3": "colour-burn",
-    "clip-6": "lighten",
-    "clip-7": "screen",
-    "clip-8": "colour-dodge",
-    "clip-10": "add",
-    "clip-12": "overlay",
-    "clip-13": "soft-light",
-    "clip-14": "hard-light",
-    "clip-15": "difference",
-    "clip-20": "exclusion",
+    "clip-6": "darken",
+    "clip-7": "lighten",
+    "clip-8": "screen",
+    "clip-9": "colour-dodge",
+    "clip-10": "colour-dodge",
+    "clip-11": "add",
+    "clip-12": "add",
+    "clip-13": "lighten",
+    "clip-14": "overlay",
+    "clip-15": "soft-light",
+    "clip-16": "hard-light",
+    "clip-21": "difference",
+    "clip-22": "exclusion",
   };
   return modes[value] || "over";
 }
@@ -2028,6 +2567,13 @@ async function decodedClipLayerPng(item, clip, layer, width, height) {
       clip.rasterSources?.[layer.id] || [],
       width,
       height,
+      {
+        canvasWidth: clip.layerDocument.nativeWidth,
+        canvasHeight: clip.layerDocument.nativeHeight,
+        offsetX: layer.offsetX + layer.renderOffsetX,
+        offsetY: layer.offsetY + layer.renderOffsetY,
+        color: layer.drawColor,
+      },
     );
     if (!decoded) return null;
     let pipeline = sharp(decoded.data, {
@@ -2046,30 +2592,229 @@ async function decodedClipLayerPng(item, clip, layer, width, height) {
   return promise;
 }
 
+function decodedClipFallbackThumbnailPng(item, clip, layer, width, height) {
+  const key = `${cacheIdentity(item)}:${layer.id}:${width}x${height}:fallback`;
+  if (clipFallbackDecodeCache.has(key)) return clipFallbackDecodeCache.get(key);
+  const promise = (async () => {
+    const levels = clip.thumbnailSources?.[layer.id] || [];
+    const level = levels[0];
+    if (!level) return null;
+    const decoded = decodeClipLayer(clip.source, levels, 512);
+    if (!decoded) return null;
+    const canvasWidth = level.canvasWidth || clip.layerDocument.nativeWidth;
+    const canvasHeight = level.canvasHeight || clip.layerDocument.nativeHeight;
+    let left = 0;
+    let top = 0;
+    let cropWidth = decoded.width;
+    let cropHeight = decoded.height;
+    if (level.useCanvasAspect && canvasWidth > 0 && canvasHeight > 0) {
+      const canvasRatio = canvasWidth / canvasHeight;
+      const thumbnailRatio = decoded.width / decoded.height;
+      if (canvasRatio < thumbnailRatio) {
+        cropWidth = Math.max(1, Math.round(decoded.height * canvasRatio));
+        left = Math.max(0, Math.floor((decoded.width - cropWidth) / 2));
+      } else if (canvasRatio > thumbnailRatio) {
+        cropHeight = Math.max(1, Math.round(decoded.width / canvasRatio));
+        top = Math.max(0, Math.floor((decoded.height - cropHeight) / 2));
+      }
+    }
+    return sharp(decoded.data, {
+      raw: { width: decoded.width, height: decoded.height, channels: 4 },
+    })
+      .extract({ left, top, width: cropWidth, height: cropHeight })
+      .resize(width, height, { fit: "fill", kernel: "lanczos3" })
+      .png({ compressionLevel: 1 })
+      .toBuffer();
+  })();
+  clipFallbackDecodeCache.set(key, promise);
+  while (clipFallbackDecodeCache.size > CLIP_FALLBACK_DECODE_CACHE_LIMIT) {
+    clipFallbackDecodeCache.delete(clipFallbackDecodeCache.keys().next().value);
+  }
+  promise.catch(() => clipFallbackDecodeCache.delete(key));
+  return promise;
+}
+
+function decodedClipObjectPng(item, clip, layer, width, height) {
+  const key = `${cacheIdentity(item)}:${layer.id}:${width}x${height}:object`;
+  if (clipObjectDecodeCache.has(key)) return clipObjectDecodeCache.get(key);
+  const promise = (async () => {
+    const transform = layer.resizable;
+    const levels = clip.objectSources?.[layer.id] || [];
+    if (!transform || !levels.length) return null;
+    const scaleX = width / Math.max(1, clip.layerDocument.nativeWidth || width);
+    const scaleY = height / Math.max(1, clip.layerDocument.nativeHeight || height);
+    const xs = transform.corners.map((point) => point.x * scaleX);
+    const ys = transform.corners.map((point) => point.y * scaleY);
+    const transformedSize = Math.max(
+      Math.max(...xs) - Math.min(...xs),
+      Math.max(...ys) - Math.min(...ys),
+    );
+    const decodeSize = Math.max(64, Math.min(4096, Math.ceil(transformedSize * 1.5)));
+    const decoded = decodeClipLayer(clip.source, levels, decodeSize, {
+      color: layer.drawColor,
+    });
+    if (!decoded) return null;
+    const source = await sharp(decoded.data, {
+      raw: { width: decoded.width, height: decoded.height, channels: 4 },
+    }).png({ compressionLevel: 1 }).toBuffer();
+    const [topLeft, topRight, bottomLeft] = transform.corners;
+    const a = (topRight.x - topLeft.x) * scaleX / decoded.width;
+    const b = (topRight.y - topLeft.y) * scaleY / decoded.width;
+    const c = (bottomLeft.x - topLeft.x) * scaleX / decoded.height;
+    const d = (bottomLeft.y - topLeft.y) * scaleY / decoded.height;
+    const e = topLeft.x * scaleX;
+    const f = topLeft.y * scaleY;
+    const svg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+      <image href="data:image/png;base64,${source.toString("base64")}" width="${decoded.width}"
+        height="${decoded.height}" preserveAspectRatio="none"
+        transform="matrix(${a} ${b} ${c} ${d} ${e} ${f})"/>
+    </svg>`);
+    return sharp(svg).png({ compressionLevel: 1 }).toBuffer();
+  })();
+  clipObjectDecodeCache.set(key, promise);
+  while (clipObjectDecodeCache.size > CLIP_OBJECT_DECODE_CACHE_LIMIT) {
+    clipObjectDecodeCache.delete(clipObjectDecodeCache.keys().next().value);
+  }
+  promise.catch(() => clipObjectDecodeCache.delete(key));
+  return promise;
+}
+
+function clipTextFontFamily(attributes, preferredFont = "") {
+  const fonts = [
+    preferredFont,
+    attributes.font,
+    ...(attributes.fonts || []).flatMap((font) => [font.display, font.internal]),
+    "Malgun Gothic",
+    "Yu Gothic",
+    "sans-serif",
+  ].filter(Boolean);
+  return [...new Set(fonts)].map((font) => (
+    font === "sans-serif" ? font : `'${escapeXml(font)}'`
+  )).join(",");
+}
+
+function clipTextAlignment(value) {
+  if (Number(value) === 1) return { anchor: "end", position: 1 };
+  if (Number(value) === 2) return { anchor: "middle", position: 0.5 };
+  return { anchor: "start", position: 0 };
+}
+
+function clipTextVisualLength(value) {
+  return [...String(value || "")].reduce((sum, character) => (
+    sum + (/\s/.test(character) ? 0.5 : 1)
+  ), 0);
+}
+
 function clipTextSvg(layer, layerDocument, width, height) {
-  const attributes = layer.textAttributes || {};
-  const bounds = attributes.bounds || [0, 0, layerDocument.nativeWidth, layerDocument.nativeHeight];
   const scaleX = width / Math.max(1, layerDocument.nativeWidth || width);
   const scaleY = height / Math.max(1, layerDocument.nativeHeight || height);
-  const x = Math.max(0, bounds[0] * scaleX);
-  const y = Math.max(0, bounds[1] * scaleY);
-  const defaultSize = Math.max(10, Math.abs(bounds[3] - bounds[1]) * scaleY);
-  const fontSize = attributes.fontSize
-    ? Math.max(6, attributes.fontSize / 100 * layerDocument.resolution / 72 * scaleY)
-    : defaultSize;
-  const colorValues = attributes.color || [0, 0, 0];
-  const color = colorValues.map(clipColorChannel);
-  const lines = String(layer.textPreview || layer.name).split(/\r\n|\r|\n/);
-  const stroke = layer.effects?.length
-    ? 'paint-order="stroke" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"'
-    : "";
-  const tspans = lines.map((line, index) => (
-    `<tspan x="${x}" dy="${index ? fontSize * 1.2 : 0}">${escapeXml(line)}</tspan>`
-  )).join("");
+  const textScale = Math.min(scaleX, scaleY);
+  const objects = layer.textObjects?.length
+    ? layer.textObjects
+    : [{ text: layer.textPreview || layer.name, attributes: layer.textAttributes }];
+  const backgrounds = [];
+  const outlines = [];
+  const fills = [];
+
+  for (const object of objects) {
+    const text = String(object.text || "");
+    if (!text) continue;
+    const attributes = object.attributes || {};
+    const bounds = attributes.bounds || [
+      0, 0, layerDocument.nativeWidth, layerDocument.nativeHeight,
+    ];
+    const left = bounds[0] * scaleX;
+    const top = bounds[1] * scaleY;
+    const right = bounds[2] * scaleX;
+    const bottom = bounds[3] * scaleY;
+    const boxWidth = Math.max(1, right - left);
+    const boxHeight = Math.max(1, bottom - top);
+    const lines = text.split(/\r\n|\r|\n/);
+    const fontSize = attributes.fontSize
+      ? Math.max(2, attributes.fontSize / 100 * layerDocument.resolution / 72 * textScale)
+      : Math.max(2, Math.min(boxWidth, boxHeight));
+    const style = Number(attributes.style) || 0;
+    const vertical = Boolean(attributes.vertical || style & 16);
+    const alignment = clipTextAlignment(attributes.align);
+    const color = attributes.color || [0, 0, 0];
+    const family = clipTextFontFamily(attributes);
+    const centerX = (left + right) / 2;
+    const centerY = (top + bottom) / 2;
+    const transforms = [];
+    if (Number(attributes.rotation)) {
+      transforms.push(`rotate(${attributes.rotation} ${centerX} ${centerY})`);
+    }
+    if (Number(attributes.skewX)) transforms.push(`skewX(${attributes.skewX})`);
+    if (Number(attributes.skewY)) transforms.push(`skewY(${attributes.skewY})`);
+    const common = [
+      `font-family="${family}"`,
+      `font-size="${fontSize}"`,
+      `font-weight="${style & 1 ? 700 : 400}"`,
+      `font-style="${style & 2 ? "italic" : "normal"}"`,
+      `text-decoration="${[
+        style & 4 ? "underline" : "",
+        style & 8 ? "line-through" : "",
+      ].filter(Boolean).join(" ") || "none"}"`,
+      "xml:space=\"preserve\"",
+      "stroke-linejoin=\"round\"",
+      "paint-order=\"stroke fill\"",
+      transforms.length ? `transform="${transforms.join(" ")}"` : "",
+    ].filter(Boolean).join(" ");
+
+    if (attributes.background?.enabled) {
+      backgrounds.push(`<rect x="${left}" y="${top}" width="${boxWidth}" height="${boxHeight}"
+        fill="rgb(${attributes.background.color.join(",")})"
+        fill-opacity="${attributes.background.opacity / 255}"/>`);
+    }
+
+    const elements = [];
+    if (vertical) {
+      const columnWidth = Math.max(fontSize, boxWidth / Math.max(1, lines.length));
+      lines.forEach((line, index) => {
+        if (!line) return;
+        const x = right - columnWidth * (index + 0.5);
+        const y = top + boxHeight * alignment.position;
+        elements.push(`<text ${common} x="${x}" y="${y}"
+          text-anchor="${alignment.anchor}" dominant-baseline="central"
+          writing-mode="vertical-rl" text-orientation="mixed"
+          textLength="${boxHeight}" lengthAdjust="spacingAndGlyphs">${escapeXml(line)}</text>`);
+      });
+    } else {
+      const lineHeight = Math.max(fontSize, boxHeight / Math.max(1, lines.length));
+      const longest = Math.max(1, ...lines.map(clipTextVisualLength));
+      lines.forEach((line, index) => {
+        if (!line) return;
+        const x = left + boxWidth * alignment.position;
+        const y = top + index * lineHeight;
+        const lineLength = Math.max(1, boxWidth * clipTextVisualLength(line) / longest);
+        elements.push(`<text ${common} x="${x}" y="${y}"
+          text-anchor="${alignment.anchor}" dominant-baseline="hanging"
+          textLength="${lineLength}" lengthAdjust="spacingAndGlyphs">${escapeXml(line)}</text>`);
+      });
+    }
+
+    const objectEdge = attributes.edge?.enabled ? attributes.edge : null;
+    const edgeWidth = objectEdge
+      ? objectEdge.width * layerDocument.resolution / 72 * textScale
+      : Math.max(0, Number(layer.edgeEffect?.width) || 0) * textScale;
+    const edgeColor = objectEdge?.color || layer.edgeEffect?.color || [255, 255, 255];
+    if (edgeWidth > 0) {
+      outlines.push(elements.map((element) => element.replace(
+        "<text ",
+        `<text fill="rgb(${edgeColor.join(",")})" stroke="rgb(${edgeColor.join(",")})" stroke-width="${edgeWidth * 2}" `,
+      )).join(""));
+    }
+    fills.push(elements.map((element) => element.replace(
+      "<text ",
+      `<text fill="rgb(${color.join(",")})" `,
+    )).join(""));
+  }
+
   return Buffer.from(`
     <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
-      <text x="${x}" y="${y + fontSize}" font-family="${escapeXml(attributes.font || "sans-serif")}"
-        font-size="${fontSize}" fill="rgb(${color.join(",")})" ${stroke}>${tspans}</text>
+      ${backgrounds.join("")}
+      ${outlines.join("")}
+      ${fills.join("")}
     </svg>
   `);
 }
@@ -2126,15 +2871,22 @@ function decodedClipMask(item, clip, layer, width, height) {
       clip.maskSources?.[layer.id] || [],
       width,
       height,
+      {
+        canvasWidth: clip.layerDocument.nativeWidth,
+        canvasHeight: clip.layerDocument.nativeHeight,
+        offsetX: layer.maskOffsetX + layer.offsetX + layer.maskRenderOffsetX,
+        offsetY: layer.maskOffsetY + layer.offsetY + layer.maskRenderOffsetY,
+      },
     );
     if (!decoded) return null;
+    if (decoded.width === width && decoded.height === height) {
+      return Buffer.from(decoded.data);
+    }
     let pipeline = sharp(decoded.data, {
       raw: { width: decoded.width, height: decoded.height, channels: 1 },
     });
-    if (decoded.width !== width || decoded.height !== height) {
-      pipeline = pipeline.resize(width, height, { fit: "fill" });
-    }
-    return pipeline.raw().toBuffer();
+    pipeline = pipeline.resize(width, height, { fit: "fill" });
+    return pipeline.extractChannel(0).raw().toBuffer();
   })();
   clipMaskDecodeCache.set(key, promise);
   while (clipMaskDecodeCache.size > CLIP_MASK_DECODE_CACHE_LIMIT) {
@@ -2145,9 +2897,16 @@ function decodedClipMask(item, clip, layer, width, height) {
 }
 
 async function applyClipLayerMask(item, clip, layer, input, width, height) {
-  if (!layer.mask || !clip.maskSources?.[layer.id]?.length) return input;
+  if (
+    !layer.mask ||
+    layer.maskVisible === false ||
+    !clip.maskSources?.[layer.id]?.length
+  ) return input;
   const mask = await decodedClipMask(item, clip, layer, width, height);
   if (!mask) return input;
+  let maximum = 0;
+  for (const value of mask) maximum = Math.max(maximum, value);
+  if (!maximum) return input;
   const { data, info } = await sharp(input).ensureAlpha().raw().toBuffer({
     resolveWithObject: true,
   });
@@ -2160,27 +2919,166 @@ async function applyClipLayerMask(item, clip, layer, input, width, height) {
   }).png({ compressionLevel: 1 }).toBuffer();
 }
 
-async function clipLeafComposite(item, clip, layer, width, height) {
+async function applyClipEdgeEffect(input, layer, width, height, layerDocument) {
+  const nativeWidth = Math.max(1, layerDocument.nativeWidth || width);
+  const nativeHeight = Math.max(1, layerDocument.nativeHeight || height);
+  const radius = Math.max(0, Math.round(
+    (Number(layer.edgeEffect?.width) || 0) *
+    Math.min(width / nativeWidth, height / nativeHeight),
+  ));
+  if (!radius) return input;
+  const alpha = await sharp(input)
+    .ensureAlpha()
+    .extractChannel(3)
+    .dilate(Math.min(1000, radius))
+    .raw()
+    .toBuffer();
+  const color = layer.edgeEffect?.color || [255, 255, 255];
+  const edge = Buffer.alloc(width * height * 4);
+  for (let pixel = 0; pixel < width * height; pixel += 1) {
+    const offset = pixel * 4;
+    edge[offset] = color[0];
+    edge[offset + 1] = color[1];
+    edge[offset + 2] = color[2];
+    edge[offset + 3] = alpha[pixel];
+  }
+  return sharp(edge, { raw: { width, height, channels: 4 } })
+    .composite([{ input }])
+    .png({ compressionLevel: 1 })
+    .toBuffer();
+}
+
+async function applyClipToneEffect(input, layer, width, height, layerDocument) {
+  const tone = layer.toneEffect;
+  if (!tone) return input;
+  const nativeWidth = Math.max(1, layerDocument.nativeWidth || width);
+  const nativeHeight = Math.max(1, layerDocument.nativeHeight || height);
+  const outputDpi = (tone.resolution || layerDocument.resolution || 72) *
+    Math.min(width / nativeWidth, height / nativeHeight);
+  const cellSize = Math.max(1, outputDpi / tone.frequency);
+  const radians = (tone.angle || 0) * Math.PI / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  const transition = Math.max(0.08, Math.min(0.5, 0.5 / cellSize));
+  const { data, info } = await sharp(input).ensureAlpha().raw().toBuffer({
+    resolveWithObject: true,
+  });
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * info.channels;
+      const sourceAlpha = data[offset + 3] / 255;
+      if (!sourceAlpha) continue;
+      const luminance = (
+        data[offset] * 0.2126 +
+        data[offset + 1] * 0.7152 +
+        data[offset + 2] * 0.0722
+      ) / 255;
+      const density = Math.max(0, Math.min(1, (1 - luminance) * sourceAlpha));
+      let dot = 0;
+      for (const sampleY of [0.25, 0.75]) {
+        for (const sampleX of [0.25, 0.75]) {
+          const pointX = x + sampleX;
+          const pointY = y + sampleY;
+          const rotatedX = (pointX * cosine + pointY * sine) / cellSize;
+          const rotatedY = (-pointX * sine + pointY * cosine) / cellSize;
+          const spot = (
+            2 -
+            Math.cos(rotatedX * Math.PI * 2) -
+            Math.cos(rotatedY * Math.PI * 2)
+          ) / 4;
+          dot += Math.max(0, Math.min(1, (density - spot) / transition + 0.5));
+        }
+      }
+      dot /= 4;
+      data[offset] = 0;
+      data[offset + 1] = 0;
+      data[offset + 2] = 0;
+      data[offset + 3] = Math.round(255 * dot * sourceAlpha);
+    }
+  }
+  return sharp(data, {
+    raw: { width, height, channels: info.channels },
+  }).png({ compressionLevel: 1 }).toBuffer();
+}
+
+async function applyPngClippingMask(input, base, width, height) {
+  const [foreground, mask] = await Promise.all([
+    sharp(input).ensureAlpha().raw().toBuffer({ resolveWithObject: true }),
+    sharp(base).ensureAlpha().extractChannel(3).raw().toBuffer(),
+  ]);
+  for (let pixel = 0; pixel < width * height; pixel += 1) {
+    const alpha = pixel * foreground.info.channels + 3;
+    foreground.data[alpha] = Math.round(foreground.data[alpha] * mask[pixel] / 255);
+  }
+  return sharp(foreground.data, {
+    raw: { width, height, channels: foreground.info.channels },
+  }).png({ compressionLevel: 1 }).toBuffer();
+}
+
+async function mapConcurrent(items, limit, mapper) {
+  const output = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      output[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return output;
+}
+
+async function clipLeafComposite(
+  item,
+  clip,
+  layer,
+  width,
+  height,
+  options = {},
+) {
+  const applyProperties = options.applyProperties !== false;
+  const allowThumbnailFallback = options.allowThumbnailFallback !== false;
+  const suppressInlineEffects = Boolean(options.suppressInlineEffects);
+  const hasIndependentSource = layer.rasterAvailable ||
+    layer.vectorAvailable ||
+    layer.objectRasterAvailable && Boolean(layer.resizable) ||
+    layer.type === "text" ||
+    layer.type === "paper" ||
+    Boolean(layer.gradient);
   let input = null;
+  let sourceType = "";
   if (layer.rasterAvailable) {
     input = await decodedClipLayerPng(item, clip, layer, width, height);
-  } else if (layer.vectorAvailable) {
+    if (input) sourceType = "raster";
+  }
+  if (!input && layer.objectRasterAvailable && layer.resizable) {
+    input = await decodedClipObjectPng(item, clip, layer, width, height);
+    if (input) sourceType = "object";
+  }
+  if (!input && layer.vectorAvailable) {
     const vector = cachedClipVector(item, clip, layer);
     if (vector) {
-      input = await sharp(clipVectorSvg(
-        layer,
+      input = await clipVectorPng(
+        suppressInlineEffects ? { ...layer, edgeEffect: null, effects: [] } : layer,
         vector,
         width,
         height,
         false,
         clip.layerDocument.nativeWidth,
         clip.layerDocument.nativeHeight,
-      )).png({ compressionLevel: 1 }).toBuffer();
+      );
+      sourceType = "vector";
     }
-  } else if (layer.gradient) {
+  }
+  if (!input && layer.gradient) {
     const svg = clipGradientSvg(layer, clip.layerDocument, width, height);
-    if (svg) input = await sharp(svg).png({ compressionLevel: 1 }).toBuffer();
-  } else if (layer.type === "paper") {
+    if (svg) {
+      input = await sharp(svg).png({ compressionLevel: 1 }).toBuffer();
+      sourceType = "gradient";
+    }
+  }
+  if (!input && layer.type === "paper") {
     const color = layer.paperColor || [255, 255, 255];
     input = await sharp({
       create: {
@@ -2190,14 +3088,44 @@ async function clipLeafComposite(item, clip, layer, width, height) {
         background: { r: color[0], g: color[1], b: color[2], alpha: 1 },
       },
     }).png({ compressionLevel: 1 }).toBuffer();
-  } else if (layer.type === "text" && layer.textPreview) {
-    input = await sharp(clipTextSvg(layer, clip.layerDocument, width, height))
+    sourceType = "paper";
+  }
+  if (!input && layer.type === "text" && layer.textObjects?.some((object) => object.text)) {
+    const textLayer = suppressInlineEffects
+      ? { ...layer, edgeEffect: null, effects: [] }
+      : layer;
+    input = await sharp(clipTextSvg(textLayer, clip.layerDocument, width, height))
       .png({ compressionLevel: 1 })
       .toBuffer();
+    sourceType = "text";
+  }
+  if (
+    !input &&
+    allowThumbnailFallback &&
+    layer.thumbnailAvailable &&
+    !hasIndependentSource
+  ) {
+    input = await decodedClipFallbackThumbnailPng(item, clip, layer, width, height);
+    if (input) sourceType = "thumbnail";
   }
   if (!input) return null;
-  input = await applyClipLayerMask(item, clip, layer, input, width, height);
-  input = await applyPngOpacity(input, Math.max(0, Math.min(1, layer.opacity / 100)));
+  if (sourceType === "raster" && layer.edgeEffect && !suppressInlineEffects) {
+    input = await applyClipEdgeEffect(input, layer, width, height, clip.layerDocument);
+  }
+  if (
+    sourceType !== "thumbnail" &&
+    sourceType !== "raster" &&
+    layer.toneEffect &&
+    !suppressInlineEffects
+  ) {
+    input = await applyClipToneEffect(input, layer, width, height, clip.layerDocument);
+  }
+  if (applyProperties) {
+    if (sourceType !== "thumbnail") {
+      input = await applyClipLayerMask(item, clip, layer, input, width, height);
+    }
+    input = await applyPngOpacity(input, Math.max(0, Math.min(1, layer.opacity / 100)));
+  }
   return {
     input,
     left: 0,
@@ -2216,9 +3144,10 @@ async function renderClipNodeList(item, clip, layers, visibility, width, height)
   if (cache.has(key)) return cache.get(key);
   return cacheNodeRender(cache, key, (async () => {
     const orderedLayers = [...(layers || [])].reverse();
-    const composites = (await Promise.all(orderedLayers.map(async (layer) => {
-      if (!clipLayerVisibility(layer, visibility)) return null;
-      if (layer.children?.length) {
+    const entries = await mapConcurrent(orderedLayers, 3, async (layer) => {
+      const visible = clipLayerVisibility(layer, visibility);
+      if (!visible) return { layer, visible, composite: null };
+      if (layer.type === "group" || layer.children?.length) {
         let input = await renderClipNodeList(
           item,
           clip,
@@ -2227,16 +3156,71 @@ async function renderClipNodeList(item, clip, layers, visibility, width, height)
           width,
           height,
         );
+        const frameVector = layer.mask && layer.maskVisible !== false && layer.vectorAvailable
+          ? cachedClipVector(item, clip, layer)
+          : null;
+        if (frameVector) {
+          input = await applyClipFrameMask(
+            input,
+            frameVector,
+            width,
+            height,
+            clip.layerDocument,
+          );
+        }
+        const own = await clipLeafComposite(item, clip, layer, width, height, {
+          applyProperties: false,
+          allowThumbnailFallback: false,
+          suppressInlineEffects: true,
+        });
+        if (own?.input) {
+          input = await sharp(input)
+            .composite([{ input: own.input }])
+            .png({ compressionLevel: 1 })
+            .toBuffer();
+        }
+        if (layer.edgeEffect) {
+          input = await applyClipEdgeEffect(input, layer, width, height, clip.layerDocument);
+        }
+        if (layer.toneEffect) {
+          input = await applyClipToneEffect(input, layer, width, height, clip.layerDocument);
+        }
+        input = await applyClipLayerMask(item, clip, layer, input, width, height);
         input = await applyPngOpacity(input, Math.max(0, Math.min(1, layer.opacity / 100)));
-        return {
-          input,
-          left: 0,
-          top: 0,
-          blend: clipBlendModeForSharp(layer.blendMode),
-        };
+        return { layer, visible, composite: {
+          input, left: 0, top: 0, blend: clipBlendModeForSharp(layer.blendMode),
+        } };
       }
-      return clipLeafComposite(item, clip, layer, width, height);
-    }))).filter(Boolean);
+      return {
+        layer,
+        visible,
+        composite: await clipLeafComposite(item, clip, layer, width, height),
+      };
+    });
+    const composites = [];
+    let clippingBase = null;
+    for (const entry of entries) {
+      if (!entry.visible) {
+        if (!entry.layer.clipping) clippingBase = null;
+        continue;
+      }
+      if (!entry.composite) {
+        if (!entry.layer.clipping) clippingBase = null;
+        continue;
+      }
+      if (entry.layer.clipping) {
+        if (!clippingBase) continue;
+        entry.composite.input = await applyPngClippingMask(
+          entry.composite.input,
+          clippingBase,
+          width,
+          height,
+        );
+      } else {
+        clippingBase = entry.composite.input;
+      }
+      composites.push(entry.composite);
+    }
     return sharp({
       create: {
         width,
@@ -2248,12 +3232,163 @@ async function renderClipNodeList(item, clip, layers, visibility, width, height)
   })());
 }
 
-async function renderLayeredImage(item, visibility = {}) {
+async function clipRawRgba(input, width, height) {
+  return sharp(input)
+    .resize(width, height, { fit: "fill" })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+}
+
+function dilateClipChangeMask(input, width, height, radius) {
+  if (radius <= 0) return Buffer.from(input);
+  const horizontal = Buffer.alloc(input.length);
+  const output = Buffer.alloc(input.length);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width;
+    for (let x = 0; x < width; x += 1) {
+      const left = Math.max(0, x - radius);
+      const right = Math.min(width - 1, x + radius);
+      for (let sample = left; sample <= right; sample += 1) {
+        if (input[row + sample]) {
+          horizontal[row + x] = 255;
+          break;
+        }
+      }
+    }
+  }
+  for (let y = 0; y < height; y += 1) {
+    const top = Math.max(0, y - radius);
+    const bottom = Math.min(height - 1, y + radius);
+    for (let x = 0; x < width; x += 1) {
+      for (let sample = top; sample <= bottom; sample += 1) {
+        if (horizontal[sample * width + x]) {
+          output[y * width + x] = 255;
+          break;
+        }
+      }
+    }
+  }
+  return output;
+}
+
+function clipHiddenTextBounds(
+  layers,
+  visibility,
+  layerDocument,
+  width,
+  height,
+  output = [],
+  originalParentVisible = true,
+  requestedParentVisible = true,
+) {
+  const scaleX = width / Math.max(1, layerDocument.nativeWidth || width);
+  const scaleY = height / Math.max(1, layerDocument.nativeHeight || height);
+  for (const layer of layers || []) {
+    const originalVisible = originalParentVisible && Boolean(layer.visible);
+    const requestedVisible = requestedParentVisible && clipLayerVisibility(layer, visibility);
+    if (layer.type === "text" && originalVisible && !requestedVisible) {
+      for (const object of layer.textObjects || []) {
+        const bounds = object.attributes?.bounds;
+        if (!Array.isArray(bounds) || bounds.length < 4) continue;
+        const margin = Math.max(
+          2,
+          Math.ceil((Number(layer.edgeEffect?.width) || 0) * Math.min(scaleX, scaleY) + 2),
+        );
+        output.push({
+          left: Math.max(0, Math.floor(bounds[0] * scaleX) - margin),
+          top: Math.max(0, Math.floor(bounds[1] * scaleY) - margin),
+          right: Math.min(width, Math.ceil(bounds[2] * scaleX) + margin),
+          bottom: Math.min(height, Math.ceil(bounds[3] * scaleY) + margin),
+        });
+      }
+    }
+    clipHiddenTextBounds(
+      layer.children,
+      visibility,
+      layerDocument,
+      width,
+      height,
+      output,
+      originalVisible,
+      requestedVisible,
+    );
+  }
+  return output;
+}
+
+async function preserveClipOriginalPixels(
+  preview,
+  originalComposite,
+  requestedComposite,
+  width,
+  height,
+  layerDocument,
+  visibility,
+) {
+  const [original, baseline, requested] = await Promise.all([
+    clipRawRgba(preview, width, height),
+    clipRawRgba(originalComposite, width, height),
+    clipRawRgba(requestedComposite, width, height),
+  ]);
+  const mask = Buffer.alloc(width * height);
+  let changed = 0;
+  for (let pixel = 0; pixel < width * height; pixel += 1) {
+    const offset = pixel * 4;
+    let difference = 0;
+    for (let channel = 0; channel < 4; channel += 1) {
+      difference = Math.max(
+        difference,
+        Math.abs(requested.data[offset + channel] - baseline.data[offset + channel]),
+      );
+    }
+    if (difference > 2) {
+      mask[pixel] = 255;
+      changed += 1;
+    }
+  }
+  for (const bounds of clipHiddenTextBounds(
+    layerDocument.layers,
+    visibility,
+    layerDocument,
+    width,
+    height,
+  )) {
+    for (let y = bounds.top; y < bounds.bottom; y += 1) {
+      mask.fill(255, y * width + bounds.left, y * width + bounds.right);
+    }
+    changed += Math.max(0, bounds.right - bounds.left) *
+      Math.max(0, bounds.bottom - bounds.top);
+  }
+  if (!changed) return preview;
+
+  const radius = Math.max(1, Math.min(4, Math.round(Math.max(width, height) / 800)));
+  const expanded = dilateClipChangeMask(mask, width, height, radius);
+  const feathered = dilateClipChangeMask(expanded, width, height, 1);
+  const output = Buffer.alloc(width * height * 4);
+  for (let pixel = 0; pixel < width * height; pixel += 1) {
+    const amount = expanded[pixel] ? 1 : feathered[pixel] ? 0.5 : 0;
+    const offset = pixel * 4;
+    for (let channel = 0; channel < 4; channel += 1) {
+      output[offset + channel] = Math.round(
+        original.data[offset + channel] * (1 - amount) +
+        requested.data[offset + channel] * amount,
+      );
+    }
+  }
+  return sharp(output, {
+    raw: { width, height, channels: 4 },
+  }).png({ compressionLevel: 1 }).toBuffer();
+}
+
+async function renderLayeredImage(item, visibility = {}, options = {}) {
   const ext = extensionOf(item.kind === "archive-entry" ? item.entryName : item.path);
   if (ext !== ".psd" && !CLIP_EXTENSIONS.has(ext)) {
     throw new Error("이 파일 형식은 레이어 합성을 지원하지 않습니다.");
   }
-  const key = visibilityCacheKey(item, visibility);
+  const key = `${visibilityCacheKey(item, visibility)}:${
+    options.preserveOriginal === false ? "approximate" : "display"
+  }`;
   if (layeredRenderCache.has(key)) return layeredRenderCache.get(key);
   return cacheLayeredRender(key, (async () => {
     let buffer;
@@ -2278,12 +3413,14 @@ async function renderLayeredImage(item, visibility = {}) {
       ({ layerDocument } = clip);
       width = layerDocument.width;
       height = layerDocument.height;
-      if (isOriginalVisibility(layerDocument, visibility)) {
+      if (
+        isOriginalVisibility(layerDocument, visibility) &&
+        options.preserveOriginal !== false
+      ) {
         source = "CLIP 저장 미리보기";
         buffer = clip.preview;
       } else {
-        source = "CLIP 레이어 합성";
-        buffer = await renderClipNodeList(
+        const requested = await renderClipNodeList(
           item,
           clip,
           layerDocument.layers,
@@ -2291,6 +3428,29 @@ async function renderLayeredImage(item, visibility = {}) {
           width,
           height,
         );
+        if (options.preserveOriginal === false) {
+          source = "CLIP 레이어 합성";
+          buffer = requested;
+        } else {
+          const originalComposite = await renderClipNodeList(
+            item,
+            clip,
+            layerDocument.layers,
+            documentVisibility(layerDocument.layers),
+            width,
+            height,
+          );
+          source = "CLIP 원본 보존 레이어 합성";
+          buffer = await preserveClipOriginalPixels(
+            clip.preview,
+            originalComposite,
+            requested,
+            width,
+            height,
+            layerDocument,
+            visibility,
+          );
+        }
       }
     }
     const stat = fs.statSync(item.kind === "archive-entry" ? item.archivePath : item.path);

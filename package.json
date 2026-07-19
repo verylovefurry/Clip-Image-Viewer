@@ -1,6 +1,6 @@
 {
   "name": "clip-image-viewer",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Windows media viewer with CLIP STUDIO PAINT, RAW, modern image and video format support",
   "main": "src/main.js",
   "author": "verylovefurry",
@@ -9,6 +9,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node test/file-types.test.js && node test/clip-layer-reader.test.js && node test/image-loader.test.js && node test/image-worker.test.js && node test/window-state.test.js && node test/updater.test.js",
+    "test:samples": "node test/clip-samples.test.js",
     "licenses": "node scripts/collect-licenses.js",
     "icon": "node scripts/make-icon.js",
     "build": "npm run build:release",

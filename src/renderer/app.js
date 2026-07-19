@@ -37,6 +37,7 @@ const state = {
   layerThumbnails: {},
   layerThumbnailLoading: new Set(),
   layerThumbnailSequence: 0,
+  collapsedLayerIds: new Set(),
   layerPreparationStarted: false,
   runtime: null,
   update: null,
@@ -153,6 +154,7 @@ function clearLayerDocument() {
   state.selectedLayerId = "";
   state.layerThumbnails = {};
   state.layerThumbnailLoading.clear();
+  state.collapsedLayerIds.clear();
   state.layerPreparationStarted = false;
   state.layersVisible = false;
   $("layerPanel")?.classList.add("hidden");
@@ -167,6 +169,7 @@ function setLayerDocument(document) {
   state.selectedLayerId = "";
   state.layerThumbnails = {};
   state.layerThumbnailLoading.clear();
+  state.collapsedLayerIds.clear();
   state.layerPreparationStarted = false;
   if (!document?.layers?.length) {
     clearLayerDocument();
@@ -184,11 +187,25 @@ function layerById(id) {
   return flattenLayers(state.layerDocument?.layers).find((layer) => layer.id === id) || null;
 }
 
+function layerAncestorIds(layers, id, ancestors = []) {
+  for (const layer of layers || []) {
+    if (layer.id === id) return ancestors;
+    const nested = layerAncestorIds(layer.children, id, [...ancestors, layer.id]);
+    if (nested) return nested;
+  }
+  return null;
+}
+
 function renderLayerDetails() {
   const layer = layerById(state.selectedLayerId);
   const panel = $("layerDetails");
+  const textObjectsPanel = $("layerTextObjects");
   panel.classList.toggle("hidden", !layer);
-  if (!layer) return;
+  if (!layer) {
+    textObjectsPanel.classList.add("hidden");
+    textObjectsPanel.innerHTML = "";
+    return;
+  }
   $("layerDetailName").textContent = layer.name;
   const values = [
     ["종류", layer.typeLabel || (layer.type === "group" ? "그룹" : layer.type)],
@@ -199,9 +216,35 @@ function renderLayerDetails() {
     ["효과", layer.effects?.length ? layer.effects.join(", ") : "없음"],
     ["미리보기", layer.previewAccuracy || "레이어 데이터"],
   ];
+  if (layer.type === "text") {
+    values.splice(1, 0, ["텍스트 객체", `${layer.textObjects?.length || 0}개`]);
+  }
+  if (layer.locked) values.push(["잠금", "잠김"]);
+  if (layer.draft) values.push(["속성", "초안 레이어"]);
   $("layerDetailList").innerHTML = values
     .map(([key, value]) => `<dt>${key}</dt><dd>${escapeHtml(String(value))}</dd>`)
     .join("");
+  const textObjects = layer.textObjects || [];
+  textObjectsPanel.classList.toggle("hidden", !textObjects.length);
+  textObjectsPanel.innerHTML = textObjects.map((object, index) => {
+    const attributes = object.attributes || {};
+    const fontSize = Number.isFinite(attributes.fontSize)
+      ? `${attributes.fontSize / 100} pt`
+      : "크기 정보 없음";
+    const bounds = attributes.bounds?.length === 4
+      ? `${attributes.bounds[0]}, ${attributes.bounds[1]} · ${
+          attributes.bounds[2] - attributes.bounds[0]
+        }×${attributes.bounds[3] - attributes.bounds[1]}`
+      : "위치 정보 없음";
+    return `
+      <article class="layer-text-object">
+        <div class="layer-text-object-heading">객체 ${index + 1}</div>
+        <div class="layer-text-object-content">${escapeHtml(object.text || "(빈 텍스트)")}</div>
+        <div class="layer-text-object-meta">${escapeHtml(
+          `${attributes.font || "글꼴 정보 없음"} · ${fontSize} · ${bounds}`,
+        )}</div>
+      </article>`;
+  }).join("");
 }
 
 function renderLayerPanel() {
@@ -236,10 +279,24 @@ function renderLayerPanel() {
         void toggleLayerVisibility(layer.id);
       });
 
-      const visual = document.createElement("span");
+      const visual = document.createElement(isGroup ? "button" : "span");
       if (isGroup) {
-        visual.className = "layer-folder-icon";
-        visual.setAttribute("aria-hidden", "true");
+        const collapsed = state.collapsedLayerIds.has(layer.id);
+        visual.type = "button";
+        visual.className = `layer-folder-toggle${collapsed ? " collapsed" : ""}`;
+        visual.setAttribute("aria-expanded", String(!collapsed));
+        visual.title = collapsed ? "폴더 펼치기" : "폴더 접기";
+        visual.innerHTML = `
+          <span class="layer-disclosure" aria-hidden="true"></span>
+          <span class="layer-folder-icon" aria-hidden="true"></span>
+        `;
+        const toggleFolder = (event) => {
+          event.stopPropagation();
+          if (collapsed) state.collapsedLayerIds.delete(layer.id);
+          else state.collapsedLayerIds.add(layer.id);
+          renderLayerPanel();
+        };
+        visual.addEventListener("click", toggleFolder);
       } else if (
         layerDocument.thumbnailSupported &&
         layer.thumbnailAvailable !== false
@@ -272,7 +329,9 @@ function renderLayerPanel() {
 
       element.append(visibility, visual, name);
       tree.appendChild(element);
-      append(layer.children, depth + 1);
+      if (!isGroup || !state.collapsedLayerIds.has(layer.id)) {
+        append(layer.children, depth + 1);
+      }
     }
   };
   append(layerDocument.layers);
@@ -286,7 +345,15 @@ async function ensureLayerThumbnails() {
   const sequence = state.layerThumbnailSequence;
   const item = currentItem();
   if (!item) return;
-  const queue = flattenLayers(layerDocument.layers).filter((layer) => (
+  const visibleLayers = [];
+  const appendVisible = (layers) => {
+    for (const layer of layers || []) {
+      visibleLayers.push(layer);
+      if (!state.collapsedLayerIds.has(layer.id)) appendVisible(layer.children);
+    }
+  };
+  appendVisible(layerDocument.layers);
+  const queue = visibleLayers.filter((layer) => (
     layer.type !== "group" &&
     !layer.children?.length &&
     layer.thumbnailAvailable !== false &&
@@ -325,6 +392,9 @@ async function ensureLayerThumbnails() {
 
 function selectLayer(id) {
   state.selectedLayerId = id;
+  layerAncestorIds(state.layerDocument?.layers, id)?.forEach((ancestorId) => {
+    state.collapsedLayerIds.delete(ancestorId);
+  });
   renderLayerPanel();
   document.querySelector(`.layer-row[data-layer-id="${CSS.escape(id)}"]`)
     ?.scrollIntoView({ block: "nearest" });

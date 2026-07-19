@@ -12,3 +12,4 @@ Thumbs.db
 work-npm-*.json
 test/*.png
 !test/sample.png
+test/samples/RecWild1_KR/

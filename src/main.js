@@ -178,7 +178,8 @@ function attachPackagedSmokeTest(window, expectedPath) {
           let thumbnailReady = false;
           for (let attempt = 0; attempt < 100; attempt += 1) {
             thumbnailReady = await window.webContents.executeJavaScript(
-              "document.querySelector('.layer-thumbnail')?.naturalWidth > 0",
+              "[...document.querySelectorAll('.layer-thumbnail')]" +
+                ".some((thumbnail) => thumbnail.naturalWidth > 0)",
             );
             if (thumbnailReady) break;
             await new Promise((resolve) => setTimeout(resolve, 100));
