@@ -164,6 +164,29 @@ function attachPackagedSmokeTest(window, expectedPath) {
       if (process.env.CLIPVIEW_SMOKE_EXPECT_VIDEO && !result?.videoPlaying) {
         throw new Error(`Packaged video did not autoplay: ${JSON.stringify(result)}`);
       }
+      if (process.env.CLIPVIEW_SMOKE_VIDEO_SHORTCUT === "1") {
+        const beforeTitle = result.title;
+        window.webContents.sendInputEvent({ type: "keyDown", keyCode: "SPACE" });
+        window.webContents.sendInputEvent({ type: "keyUp", keyCode: "SPACE" });
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const paused = await window.webContents.executeJavaScript(`(() => ({
+          paused: document.getElementById("viewerVideo").paused,
+          title: document.title,
+        }))()`);
+        if (!paused.paused || paused.title !== beforeTitle) {
+          throw new Error(`Packaged Space pause failed: ${JSON.stringify(paused)}`);
+        }
+        window.webContents.sendInputEvent({ type: "keyDown", keyCode: "SPACE" });
+        window.webContents.sendInputEvent({ type: "keyUp", keyCode: "SPACE" });
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const resumed = await window.webContents.executeJavaScript(`(() => ({
+          paused: document.getElementById("viewerVideo").paused,
+          title: document.title,
+        }))()`);
+        if (resumed.paused || resumed.title !== beforeTitle) {
+          throw new Error(`Packaged Space resume failed: ${JSON.stringify(resumed)}`);
+        }
+      }
       if (process.env.CLIPVIEW_SMOKE_VIDEO_THUMBNAIL === "1") {
         await window.webContents.executeJavaScript(
           "document.getElementById('thumbBtn').click()",

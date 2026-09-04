@@ -76,6 +76,30 @@ function attachElectronSmoke({
       );
       await wait(250);
 
+      if (process.env.CLIPVIEW_SMOKE_VIDEO_SHORTCUT === "1") {
+        const beforeTitle = title;
+        mainWindow.webContents.sendInputEvent({ type: "keyDown", keyCode: "SPACE" });
+        mainWindow.webContents.sendInputEvent({ type: "keyUp", keyCode: "SPACE" });
+        await wait(150);
+        const paused = await mainWindow.webContents.executeJavaScript(`(() => ({
+          paused: document.getElementById("viewerVideo").paused,
+          title: document.title,
+        }))()`);
+        if (!paused.paused || paused.title !== beforeTitle) {
+          throw new Error(`Space did not pause the current video: ${JSON.stringify(paused)}`);
+        }
+        mainWindow.webContents.sendInputEvent({ type: "keyDown", keyCode: "SPACE" });
+        mainWindow.webContents.sendInputEvent({ type: "keyUp", keyCode: "SPACE" });
+        await wait(150);
+        const resumed = await mainWindow.webContents.executeJavaScript(`(() => ({
+          paused: document.getElementById("viewerVideo").paused,
+          title: document.title,
+        }))()`);
+        if (resumed.paused || resumed.title !== beforeTitle) {
+          throw new Error(`Space did not resume the current video: ${JSON.stringify(resumed)}`);
+        }
+      }
+
       if (process.env.CLIPVIEW_SMOKE_SHELL_THUMBNAIL) {
         const shellThumbnail = await nativeImage.createThumbnailFromPath(
           process.env.CLIPVIEW_SMOKE_SHELL_THUMBNAIL,

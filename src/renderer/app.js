@@ -714,8 +714,8 @@ function updateVideoUi() {
   videoTitleLabel.textContent = currentItem()?.name || "";
   videoPlayBtn.classList.toggle("playing", !video.paused);
   videoPlayBtn.title = video.paused
-    ? "재생 (Ctrl+Space)"
-    : "일시정지 (Ctrl+Space)";
+    ? "재생 (Space)"
+    : "일시정지 (Space)";
   if (video.paused) document.body.classList.remove("video-cursor-hidden");
   videoVolume.value = String(video.muted ? 0 : video.volume);
   updateRangeProgress(videoVolume, (video.muted ? 0 : video.volume) * 100);
@@ -1424,14 +1424,15 @@ function changeVideoVolume(delta) {
 }
 
 function handleVideoShortcut(event, key) {
-  if (state.mediaType !== "video" || !event.ctrlKey || event.altKey || event.shiftKey) {
+  if (state.mediaType !== "video" || event.altKey || event.metaKey || event.shiftKey) {
     return false;
   }
   if (key === " ") {
     event.preventDefault();
-    toggleVideoPlayback();
+    if (!event.repeat) toggleVideoPlayback();
     return true;
   }
+  if (!event.ctrlKey) return false;
   if (key === "arrowleft") {
     event.preventDefault();
     seekVideoBy(-5);
