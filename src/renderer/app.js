@@ -81,6 +81,7 @@ let videoClickTimer = null;
 let videoControlInteracting = false;
 let thumbnailRenderSequence = 0;
 const imageCache = new Map();
+const videoThumbnailCache = new Map();
 
 function currentItem() {
   return state.items[state.index] || null;
@@ -1119,6 +1120,11 @@ async function loadCurrentVideo(item) {
     showVideoControls("full", 2000);
     updateUi();
     preloadAdjacentImages();
+    void video.play().catch((error) => {
+      if (sequence !== loadSequence || state.mediaType !== "video") return;
+      showToast(error?.message || "동영상을 자동 재생하지 못했습니다.", true);
+      updateVideoUi();
+    });
   } catch (error) {
     if (sequence !== loadSequence) return;
     state.videoSrc = "";
@@ -1215,6 +1221,97 @@ function videoPlaceholderDataUrl(item) {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
+async function loadVideoThumbnail(item) {
+  const media = await window.clipView.mediaFileUrl(item);
+  return new Promise((resolve, reject) => {
+    const preview = document.createElement("video");
+    const canvas = document.createElement("canvas");
+    const width = 300;
+    const height = 152;
+    let settled = false;
+    let seeking = false;
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      preview.removeEventListener("loadedmetadata", handleMetadata);
+      preview.removeEventListener("loadeddata", handleLoadedData);
+      preview.removeEventListener("seeked", capture);
+      preview.removeEventListener("error", handleError);
+      preview.removeAttribute("src");
+      preview.load();
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const capture = () => {
+      if (!preview.videoWidth || !preview.videoHeight) return;
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      context.fillStyle = "#151923";
+      context.fillRect(0, 0, width, height);
+      const scale = Math.min(width / preview.videoWidth, height / preview.videoHeight);
+      const drawWidth = preview.videoWidth * scale;
+      const drawHeight = preview.videoHeight * scale;
+      context.drawImage(
+        preview,
+        (width - drawWidth) / 2,
+        (height - drawHeight) / 2,
+        drawWidth,
+        drawHeight,
+      );
+      finish(resolve, canvas.toDataURL("image/jpeg", 0.84));
+    };
+    const handleMetadata = () => {
+      const duration = Number.isFinite(preview.duration) ? preview.duration : 0;
+      const target = duration > 0.25
+        ? Math.min(5, Math.max(0.1, duration * 0.1), duration - 0.1)
+        : 0;
+      if (target > 0.01) {
+        seeking = true;
+        preview.currentTime = target;
+      } else if (preview.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        capture();
+      }
+    };
+    const handleLoadedData = () => {
+      if (!seeking) capture();
+    };
+    const handleError = () => finish(reject, new Error("영상 썸네일을 만들 수 없습니다."));
+    const timeout = setTimeout(
+      () => finish(reject, new Error("영상 썸네일 생성 시간이 초과되었습니다.")),
+      8000,
+    );
+
+    preview.preload = "auto";
+    preview.muted = true;
+    preview.playsInline = true;
+    preview.addEventListener("loadedmetadata", handleMetadata);
+    preview.addEventListener("loadeddata", handleLoadedData);
+    preview.addEventListener("seeked", capture);
+    preview.addEventListener("error", handleError);
+    preview.src = media.url;
+    preview.load();
+  });
+}
+
+async function loadVideoThumbnailCached(item) {
+  const key = item.path || item.displayPath || item.name;
+  if (videoThumbnailCache.has(key)) return videoThumbnailCache.get(key);
+  const thumbnail = loadVideoThumbnail(item).catch((error) => {
+    videoThumbnailCache.delete(key);
+    throw error;
+  });
+  videoThumbnailCache.set(key, thumbnail);
+  if (videoThumbnailCache.size > 300) {
+    videoThumbnailCache.delete(videoThumbnailCache.keys().next().value);
+  }
+  return thumbnail;
+}
+
 async function renderThumbnails() {
   const sequence = ++thumbnailRenderSequence;
   const items = state.items;
@@ -1235,14 +1332,14 @@ async function renderThumbnails() {
   const queue = [...strip.children].map((element) => ({
     element,
     index: Number(element.dataset.index),
-  }));
-  const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+  })).sort((a, b) => Math.abs(a.index - state.index) - Math.abs(b.index - state.index));
+  const workers = Array.from({ length: Math.min(2, queue.length) }, async () => {
     while (queue.length) {
       const { element, index } = queue.shift();
       const item = items[index];
       try {
         const source = isVideoItem(item)
-          ? videoPlaceholderDataUrl(item)
+          ? await loadVideoThumbnailCached(item).catch(() => videoPlaceholderDataUrl(item))
           : await window.clipView.loadThumbnail(item);
         if (sequence !== thumbnailRenderSequence || !element.isConnected) return;
         element.querySelector("img").src = source;

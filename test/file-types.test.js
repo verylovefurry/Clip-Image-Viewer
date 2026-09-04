@@ -20,6 +20,9 @@ const registered = new Set(
   [...installer.matchAll(/UnregisterClipImageViewerExtension "([^"]+)"/g)]
     .map((match) => match[1]),
 );
+assert(installer.includes("!insertmacro RegisterWebmThumbnailHandler"));
+assert(installer.includes("{E357FCCD-A995-4576-B01F-234630154E96}"));
+assert(installer.includes("{9DBD2C50-62AD-11D0-B806-00C04FD706EC}"));
 assert.deepStrictEqual(
   [...registered].sort(),
   [...SUPPORTED_EXTENSIONS].sort(),

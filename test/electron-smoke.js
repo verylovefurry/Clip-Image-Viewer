@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const { nativeImage } = require("electron");
 
 function ignoreBrokenPipe(stream) {
   if (!stream || typeof stream.on !== "function") return;
@@ -34,30 +35,82 @@ function attachElectronSmoke({
     try {
       await wait(500);
       let title = await mainWindow.webContents.executeJavaScript("document.title");
+      let mediaState = null;
       if (expectedPath) {
         for (let attempt = 0; attempt < 100; attempt += 1) {
-          const rendered = await mainWindow.webContents.executeJavaScript(`(() => {
+          mediaState = await mainWindow.webContents.executeJavaScript(`(() => {
             const layer = document.getElementById("imageLayer");
             const loading = document.getElementById("loading");
             const image = document.getElementById("viewerImage");
-            return (
-              !layer.classList.contains("hidden") &&
-              loading.classList.contains("hidden") &&
-              image.complete &&
-              image.naturalWidth > 0
-            );
+            const video = document.getElementById("viewerVideo");
+            return {
+              imageRendered: image.complete && image.naturalWidth > 0 &&
+                !image.classList.contains("hidden"),
+              videoRendered: video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+                !video.classList.contains("hidden"),
+              videoPlaying: !video.paused && !video.ended,
+              visible: !layer.classList.contains("hidden"),
+              loadingHidden: loading.classList.contains("hidden"),
+            };
           })()`);
           title = await mainWindow.webContents.executeJavaScript("document.title");
-          if (title !== productName && rendered) break;
+          if (
+            title !== productName &&
+            mediaState.visible &&
+            mediaState.loadingHidden &&
+            (mediaState.imageRendered || mediaState.videoRendered) &&
+            (!process.env.CLIPVIEW_SMOKE_EXPECT_VIDEO || mediaState.videoPlaying)
+          ) break;
           await wait(100);
         }
-        if (title === productName) throw new Error("Image did not finish loading");
+        if (title === productName || !mediaState?.visible || !mediaState?.loadingHidden) {
+          throw new Error(`Media did not finish loading: ${JSON.stringify(mediaState)}`);
+        }
+        if (process.env.CLIPVIEW_SMOKE_EXPECT_VIDEO && !mediaState.videoPlaying) {
+          throw new Error(`Video did not autoplay: ${JSON.stringify(mediaState)}`);
+        }
       }
 
       await mainWindow.webContents.executeJavaScript(
         "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
       );
       await wait(250);
+
+      if (process.env.CLIPVIEW_SMOKE_SHELL_THUMBNAIL) {
+        const shellThumbnail = await nativeImage.createThumbnailFromPath(
+          process.env.CLIPVIEW_SMOKE_SHELL_THUMBNAIL,
+          { width: 256, height: 256 },
+        );
+        if (shellThumbnail.isEmpty()) {
+          throw new Error("Windows shell did not create a WebM thumbnail");
+        }
+      }
+
+      if (process.env.CLIPVIEW_SMOKE_VIDEO_THUMBNAIL === "1") {
+        await mainWindow.webContents.executeJavaScript(
+          "document.getElementById('thumbBtn').click()",
+        );
+        let thumbnail = null;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          thumbnail = await mainWindow.webContents.executeJavaScript(`(() => {
+            const image = document.querySelector(".thumb-item.active img");
+            return image ? {
+              complete: image.complete,
+              width: image.naturalWidth,
+              source: image.src.slice(0, 32),
+            } : null;
+          })()`);
+          if (
+            thumbnail?.complete &&
+            thumbnail.width > 0 &&
+            thumbnail.source.startsWith("data:image/jpeg")
+          ) break;
+          await wait(100);
+        }
+        if (!thumbnail?.source.startsWith("data:image/jpeg")) {
+          throw new Error(`Video thumbnail was not extracted: ${JSON.stringify(thumbnail)}`);
+        }
+      }
 
       if (smokeListTest) {
         const selection = await mainWindow.webContents.executeJavaScript(`(() => {

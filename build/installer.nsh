@@ -2,6 +2,10 @@
 !include "LogicLib.nsh"
 !include "MUI2.nsh"
 
+!define CLIPVIEW_THUMBNAIL_INTERFACE "{E357FCCD-A995-4576-B01F-234630154E96}"
+!define CLIPVIEW_EXTRACT_IMAGE_INTERFACE "{BB2E617C-0920-11D1-9A0B-00C04FC2D6C1}"
+!define CLIPVIEW_PROPERTY_THUMBNAIL_HANDLER "{9DBD2C50-62AD-11D0-B806-00C04FD706EC}"
+
 !ifndef BUILD_UNINSTALLER
   Var AssocBasicCheckbox
   Var AssocBasicEnabled
@@ -54,6 +58,28 @@ FunctionEnd
   WriteRegStr HKCU "Software\ClipImageViewer\Capabilities" "ApplicationName" "Clip Image Viewer"
   WriteRegStr HKCU "Software\ClipImageViewer\Capabilities" "ApplicationDescription" "다양한 이미지, 동영상, CLIP STUDIO PAINT 문서를 보는 미디어 뷰어"
   WriteRegStr HKCU "Software\ClipImageViewer\Capabilities" "ApplicationIcon" "$INSTDIR\ClipImageViewer.exe,0"
+!macroend
+
+!macro RegisterWebmThumbnailHandler
+  ReadRegStr $0 HKCR ".webm\ShellEx\${CLIPVIEW_THUMBNAIL_INTERFACE}" ""
+  ${If} $0 == ""
+    ReadRegStr $0 HKCR ".webm\ShellEx\${CLIPVIEW_EXTRACT_IMAGE_INTERFACE}" ""
+    ${If} $0 == ""
+      WriteRegStr HKCU "Software\Classes\.webm\ShellEx\${CLIPVIEW_THUMBNAIL_INTERFACE}" "" "${CLIPVIEW_PROPERTY_THUMBNAIL_HANDLER}"
+      WriteRegStr HKCU "Software\Classes\.webm\ShellEx\${CLIPVIEW_EXTRACT_IMAGE_INTERFACE}" "" "${CLIPVIEW_PROPERTY_THUMBNAIL_HANDLER}"
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+!macro UnregisterWebmThumbnailHandler
+  ReadRegStr $0 HKCU "Software\Classes\.webm\ShellEx\${CLIPVIEW_THUMBNAIL_INTERFACE}" ""
+  ${If} $0 == "${CLIPVIEW_PROPERTY_THUMBNAIL_HANDLER}"
+    DeleteRegKey HKCU "Software\Classes\.webm\ShellEx\${CLIPVIEW_THUMBNAIL_INTERFACE}"
+  ${EndIf}
+  ReadRegStr $0 HKCU "Software\Classes\.webm\ShellEx\${CLIPVIEW_EXTRACT_IMAGE_INTERFACE}" ""
+  ${If} $0 == "${CLIPVIEW_PROPERTY_THUMBNAIL_HANDLER}"
+    DeleteRegKey HKCU "Software\Classes\.webm\ShellEx\${CLIPVIEW_EXTRACT_IMAGE_INTERFACE}"
+  ${EndIf}
 !macroend
 
 !macro UnregisterClipImageViewerExtension EXT
@@ -201,6 +227,7 @@ FunctionEnd
 !macroend
 
 !macro customInstall
+  !insertmacro RegisterWebmThumbnailHandler
   ${If} ${isUpdated}
     ClearErrors
     ReadRegDWORD $0 HKCU "Software\ClipImageViewer\Settings" "AssociationsEnabled"
@@ -222,6 +249,7 @@ FunctionEnd
 
 !macro customUnInstall
   ${IfNot} ${isUpdated}
+    !insertmacro UnregisterWebmThumbnailHandler
     !insertmacro UnregisterAllExtensions
     DeleteRegKey HKCU "Software\ClipImageViewer\Settings"
     System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'

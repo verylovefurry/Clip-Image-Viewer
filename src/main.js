@@ -140,20 +140,46 @@ function attachPackagedSmokeTest(window, expectedPath) {
         await new Promise((resolve) => setTimeout(resolve, 100));
         result = await window.webContents.executeJavaScript(`(() => {
           const image = document.getElementById("viewerImage");
+          const video = document.getElementById("viewerVideo");
           return {
             title: document.title,
-            rendered: image.complete && image.naturalWidth > 0,
+            rendered: (image.complete && image.naturalWidth > 0) ||
+              (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+                !video.classList.contains("hidden")),
+            videoPlaying: !video.classList.contains("hidden") &&
+              !video.paused && !video.ended,
             loading: !document.getElementById("loading").classList.contains("hidden"),
           };
         })()`);
         if (
           (!expectedPath || result.title !== PRODUCT_NAME) &&
           result.rendered &&
-          !result.loading
+          !result.loading &&
+          (!process.env.CLIPVIEW_SMOKE_EXPECT_VIDEO || result.videoPlaying)
         ) break;
       }
       if (expectedPath && (result?.title === PRODUCT_NAME || !result?.rendered)) {
-        throw new Error(`Packaged image loading failed: ${JSON.stringify(result)}`);
+        throw new Error(`Packaged media loading failed: ${JSON.stringify(result)}`);
+      }
+      if (process.env.CLIPVIEW_SMOKE_EXPECT_VIDEO && !result?.videoPlaying) {
+        throw new Error(`Packaged video did not autoplay: ${JSON.stringify(result)}`);
+      }
+      if (process.env.CLIPVIEW_SMOKE_VIDEO_THUMBNAIL === "1") {
+        await window.webContents.executeJavaScript(
+          "document.getElementById('thumbBtn').click()",
+        );
+        let thumbnail = null;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          thumbnail = await window.webContents.executeJavaScript(`(() => {
+            const image = document.querySelector(".thumb-item.active img");
+            return image ? { width: image.naturalWidth, source: image.src.slice(0, 32) } : null;
+          })()`);
+          if (thumbnail?.width > 0 && thumbnail.source.startsWith("data:image/jpeg")) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (!thumbnail?.source.startsWith("data:image/jpeg")) {
+          throw new Error(`Packaged video thumbnail failed: ${JSON.stringify(thumbnail)}`);
+        }
       }
       if (process.env.CLIPVIEW_SMOKE_OPEN_LAYERS === "1") {
         let layers = null;
