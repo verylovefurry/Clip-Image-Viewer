@@ -57,6 +57,8 @@ const psdDocumentCache = new Map();
 const PSD_DOCUMENT_CACHE_LIMIT = 1;
 const layerThumbnailCache = new Map();
 const LAYER_THUMBNAIL_CACHE_LIMIT = 256;
+const thumbnailCache = new Map();
+const THUMBNAIL_CACHE_LIMIT = 256;
 const layeredRenderCache = new Map();
 const LAYERED_RENDER_CACHE_LIMIT = 12;
 const psdLeafCompositeCache = new WeakMap();
@@ -1306,7 +1308,7 @@ function applyClipLayerAvailability(
     : "레이어 구조와 종류별 미리보기만 제공합니다. 이 파일에는 독립 합성 가능한 레이어 데이터가 없습니다.";
 }
 
-async function extractClipData(input) {
+async function extractClipData(input, { previewOnly = false } = {}) {
   const databaseBytes = Buffer.isBuffer(input)
     ? findSqliteDatabase(input)
     : readSqliteDatabaseFromFile(input);
@@ -1326,6 +1328,7 @@ async function extractClipData(input) {
       if (!image || !image.length) {
         throw new Error("CLIP 캔버스 미리보기가 비어 있습니다.");
       }
+      if (previewOnly) return { preview: Buffer.from(image) };
       let crop = null;
       let canvasRow = null;
       const tableStatement = db.prepare(
@@ -1411,7 +1414,7 @@ async function extractClipData(input) {
 }
 
 async function extractClipPreview(input) {
-  return (await extractClipData(input)).preview;
+  return (await extractClipData(input, { previewOnly: true })).preview;
 }
 
 async function renderWebtoonPsd(buffer) {
@@ -1554,7 +1557,7 @@ async function getPsdDocument(item, input = null) {
   }
   const source = input || (item.kind === "archive-entry"
     ? readArchiveEntry(item)
-    : fs.readFileSync(item.path));
+    : readFileChecked(item.path));
   const promise = Promise.resolve().then(() => {
     const psd = readAgPsd(source, true);
     return { psd, layerDocument: psdLayerDocument(psd) };
@@ -1644,8 +1647,7 @@ async function sourceBuffer(item) {
   const ext = extensionOf(item.kind === "archive-entry" ? item.entryName : item.path);
 
   if (CLIP_EXTENSIONS.has(ext)) {
-    const input = item.kind === "archive-entry" ? readArchiveEntry(item) : null;
-    const clip = await cachedClipData(item, input);
+    const clip = await cachedClipData(item);
     const crop = clip.crop
       ? { ...clip.crop }
       : (item.crop ? { ...item.crop } : null);
@@ -3580,12 +3582,39 @@ async function loadImage(item, cropMode = "full") {
 }
 
 async function loadThumbnail(item, width = 180, height = 110) {
-  const { buffer } = await sourceBuffer(item);
-  const thumbnail = await sharp(buffer, { page: 0 })
+  if (![width, height].every((value) => Number.isInteger(value) && value > 0 && value <= 2048)) {
+    throw new Error("미리보기 크기가 안전 제한을 초과합니다.");
+  }
+  const identity = cacheIdentity(item);
+  const key = `${identity}:${width}:${height}`;
+  if (thumbnailCache.has(key)) {
+    const cached = thumbnailCache.get(key);
+    thumbnailCache.delete(key);
+    thumbnailCache.set(key, cached);
+    return cached;
+  }
+  const ext = extensionOf(item.kind === "archive-entry" ? item.entryName : item.path);
+  let input;
+  if (CLIP_EXTENSIONS.has(ext)) {
+    input = clipSourceCache.has(identity)
+      ? (await cachedClipData(item)).preview
+      : await extractClipPreview(item.kind === "archive-entry" ? readArchiveEntry(item) : item.path);
+  } else if (item.kind !== "archive-entry" && [".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif"].includes(ext)) {
+    assertSourceSize(item.path);
+    input = item.path;
+  } else {
+    input = (await sourceBuffer(item)).buffer;
+  }
+  const thumbnail = await sharp(input, { page: 0 })
     .resize(width, height, { fit: "inside", withoutEnlargement: true })
-    .png({ compressionLevel: 7 })
+    .png({ compressionLevel: 1 })
     .toBuffer();
-  return `data:image/png;base64,${thumbnail.toString("base64")}`;
+  const dataUrl = `data:image/png;base64,${thumbnail.toString("base64")}`;
+  thumbnailCache.set(key, dataUrl);
+  while (thumbnailCache.size > THUMBNAIL_CACHE_LIMIT) {
+    thumbnailCache.delete(thumbnailCache.keys().next().value);
+  }
+  return dataUrl;
 }
 
 module.exports = {

@@ -80,6 +80,8 @@ let cancelPendingVideoLoad = null;
 let videoClickTimer = null;
 let videoControlInteracting = false;
 let thumbnailRenderSequence = 0;
+let thumbnailObserver = null;
+let thumbnailController = null;
 const imageCache = new Map();
 const videoThumbnailCache = new Map();
 
@@ -115,13 +117,13 @@ function clearVideo() {
   cancelPendingVideoLoad = null;
   clearTimeout(state.videoControlsTimer);
   clearSubtitleTracks();
-  video.pause();
-  video.onloadedmetadata = null;
-  video.onerror = null;
-  video.removeAttribute("src");
+  if (video.hasAttribute("src")) {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  }
   video.removeAttribute("width");
   video.removeAttribute("height");
-  video.load();
   state.videoSrc = "";
   videoControls.classList.add("hidden");
   videoControls.classList.remove("controls-hidden", "peek-progress", "peek-volume");
@@ -161,6 +163,7 @@ function clearLayerDocument() {
   $("layerPanel")?.classList.add("hidden");
   $("layerBtn")?.classList.add("hidden");
   $("layerBtn")?.classList.remove("active");
+  $("layerTree").replaceChildren();
 }
 
 function setLayerDocument(document) {
@@ -181,7 +184,7 @@ function setLayerDocument(document) {
   });
   state.renderedLayerVisibility = { ...state.layerVisibility };
   $("layerBtn").classList.remove("hidden");
-  renderLayerPanel();
+  if (state.layersVisible) renderLayerPanel();
 }
 
 function layerById(id) {
@@ -365,7 +368,7 @@ async function ensureLayerThumbnails() {
   queue.forEach((layer) => state.layerThumbnailLoading.add(layer.id));
 
   const loadNext = async () => {
-    while (queue.length && sequence === state.layerThumbnailSequence) {
+    while (queue.length && state.layersVisible && sequence === state.layerThumbnailSequence) {
       const layer = queue.shift();
       try {
         const dataUrl = await window.clipView.loadLayerThumbnail(item, layer.id);
@@ -417,6 +420,7 @@ async function toggleLayerVisibility(id) {
     );
     if (sequence !== state.layerRenderSequence) return;
     await decodeImage(result.dataUrl);
+    if (sequence !== state.layerRenderSequence) return;
     state.imageDataUrl = result.dataUrl;
     state.metadata = result.metadata;
     image.src = result.dataUrl;
@@ -446,13 +450,26 @@ function toggleLayers(force) {
   $("layerPanel").classList.toggle("hidden", !state.layersVisible);
   $("layerBtn").classList.toggle("active", state.layersVisible);
   if (state.layersVisible && state.infoVisible) toggleInfo(false);
+  if (!state.layersVisible) {
+    state.layerThumbnailSequence += 1;
+    state.layerThumbnailLoading.clear();
+    state.layerPreparationStarted = false;
+  }
   if (state.layersVisible) {
-    void ensureLayerThumbnails();
+    renderLayerPanel();
     if (!state.layerPreparationStarted) {
       state.layerPreparationStarted = true;
       const item = currentItem();
+      const sequence = state.layerThumbnailSequence;
       setTimeout(() => {
-        if (item) void window.clipView.prepareLayeredImage(item).catch(() => {});
+        if (item && currentItem() === item && state.layersVisible &&
+            sequence === state.layerThumbnailSequence) {
+          void window.clipView.prepareLayeredImage(item).catch(() => {
+            if (sequence === state.layerThumbnailSequence) state.layerPreparationStarted = false;
+          });
+        } else if (sequence === state.layerThumbnailSequence) {
+          state.layerPreparationStarted = false;
+        }
       }, 150);
     }
   }
@@ -613,22 +630,29 @@ async function decodeImage(dataUrl) {
   });
 }
 
-function loadImageCached(index) {
+function loadImageCached(index, prefetch = false) {
   const key = imageKey(index);
-  if (imageCache.has(key)) return imageCache.get(key);
+  const existing = imageCache.get(key);
+  if (existing?.result) return Promise.resolve(existing.result);
+  if (existing && prefetch) return existing.promise;
   const item = state.items[index];
   if (isVideoItem(item)) return Promise.reject(new Error("이미지 파일이 아닙니다."));
-  const promise = window.clipView.loadImage(item, state.cropMode)
+  const entry = { result: null, promise: null };
+  // Reissue a pending prefetch as foreground work; the worker deduplicates and promotes it.
+  entry.promise = window.clipView.loadImage(item, state.cropMode, prefetch)
     .then(async (result) => {
-      await decodeImage(result.dataUrl);
+      if (imageCache.get(key) === entry) {
+        await decodeImage(result.dataUrl);
+        entry.result = result;
+      }
       return result;
     })
     .catch((error) => {
-      imageCache.delete(key);
+      if (imageCache.get(key) === entry) imageCache.delete(key);
       throw error;
     });
-  imageCache.set(key, promise);
-  return promise;
+  imageCache.set(key, entry);
+  return entry.promise;
 }
 
 function pruneImageCache() {
@@ -644,7 +668,7 @@ function preloadAdjacentImages() {
   pruneImageCache();
   for (const index of adjacentIndices()) {
     if (isVideoItem(state.items[index])) continue;
-    void loadImageCached(index).catch(() => {});
+    void loadImageCached(index, true).catch(() => {});
   }
 }
 
@@ -784,10 +808,6 @@ function nextVideoIndexForMode() {
 async function playVideoIndex(index) {
   if (index < 0) return;
   await selectItem(index);
-  if (state.mediaType === "video") {
-    void video.play().catch(() => {});
-    showVideoControls("full", 2000);
-  }
 }
 
 function handleVideoEnded() {
@@ -971,18 +991,25 @@ function updateUi() {
   const showCropModes = !isVideoItem(item) && Boolean(state.comic?.cropAvailable);
   $("cropModeSelect").classList.toggle("hidden", !showCropModes);
   $("cropModeSelect").value = state.cropMode;
-  updateInfoPanel();
+  if (state.infoVisible) updateInfoPanel();
 
-  document.querySelectorAll(".thumb-item").forEach((element, index) => {
-    element.classList.toggle("active", index === state.index);
-  });
-  const activeThumb = document.querySelector(".thumb-item.active");
-  activeThumb?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+  const strip = $("thumbnailStrip");
+  const previousThumb = strip.querySelector(".thumb-item.active");
+  const activeThumb = strip.children[state.index];
+  if (previousThumb !== activeThumb) {
+    previousThumb?.classList.remove("active");
+    activeThumb?.classList.add("active");
+    if (state.thumbsVisible) {
+      activeThumb?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    }
+  }
 }
 
 async function loadCurrent() {
   const item = currentItem();
   if (!item) return;
+  void window.clipView.setActiveItem(item).catch(() => {});
+  pruneImageCache();
   if (isVideoItem(item)) {
     await loadCurrentVideo(item);
     return;
@@ -993,7 +1020,7 @@ async function loadCurrent() {
 async function loadCurrentImage(item) {
   const sequence = ++loadSequence;
   state.layerRenderSequence += 1;
-  const cached = imageCache.has(imageKey(state.index));
+  const cached = Boolean(imageCache.get(imageKey(state.index))?.result);
   loading.classList.toggle("hidden", cached);
   emptyState.classList.add("hidden");
   clearVideo();
@@ -1025,14 +1052,6 @@ async function loadCurrentImage(item) {
     fitImage();
     updateUi();
     preloadAdjacentImages();
-    if (state.layerDocument?.toggleSupported) {
-      state.layerPreparationStarted = true;
-      setTimeout(() => {
-        if (sequence === loadSequence && currentItem() === item) {
-          void window.clipView.prepareLayeredImage(item).catch(() => {});
-        }
-      }, 100);
-    }
   } catch (error) {
     if (sequence !== loadSequence) return;
     state.imageDataUrl = "";
@@ -1156,11 +1175,13 @@ async function openPath(targetPath) {
     selectionSequence += 1;
     state.comic = collection.comic || null;
     imageCache.clear();
-    thumbnailRenderSequence += 1;
+    stopThumbnailLoading();
+    videoThumbnailCache.clear();
     $("thumbnailStrip").innerHTML = "";
     updateUi();
-    await loadCurrent();
+    const mediaLoad = loadCurrent();
     if (state.thumbsVisible) renderThumbnails();
+    await mediaLoad;
   } catch (error) {
     if (sequence !== openSequence) return;
     showToast(error?.message || "경로를 열지 못했습니다.", true);
@@ -1171,7 +1192,14 @@ async function selectItem(index, options = {}) {
   if (!Number.isInteger(index) || index < 0 || index >= state.items.length) return;
   if (options.stopSlideshow !== false) stopSlideshow();
   const sequence = ++selectionSequence;
+  openSequence += 1;
+  loadSequence += 1;
+  state.layerRenderSequence += 1;
+  cancelPendingVideoLoad?.();
   state.index = index;
+  clearLayerDocument();
+  void window.clipView.setActiveItem(currentItem()).catch(() => {});
+  pruneImageCache();
   updateUi();
   await new Promise((resolve) => setTimeout(resolve, options.immediate ? 0 : 40));
   if (sequence !== selectionSequence) return;
@@ -1195,6 +1223,7 @@ function toggleInfo(force) {
   state.infoVisible = force ?? !state.infoVisible;
   $("infoPanel").classList.toggle("hidden", !state.infoVisible);
   $("infoBtn").classList.toggle("active", state.infoVisible);
+  if (state.infoVisible) updateInfoPanel();
   if (state.infoVisible && state.layersVisible) toggleLayers(false);
   setTimeout(() => state.fitMode && fitImage(), 0);
 }
@@ -1204,6 +1233,7 @@ function toggleThumbnails(force) {
   $("thumbnailPanel").classList.toggle("hidden", !state.thumbsVisible);
   $("thumbBtn").classList.toggle("active", state.thumbsVisible);
   if (state.thumbsVisible) renderThumbnails();
+  else stopThumbnailLoading();
   setTimeout(() => state.fitMode && fitImage(), 0);
 }
 
@@ -1221,8 +1251,9 @@ function videoPlaceholderDataUrl(item) {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
-async function loadVideoThumbnail(item) {
+async function loadVideoThumbnail(item, signal) {
   const media = await window.clipView.mediaFileUrl(item);
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const preview = document.createElement("video");
     const canvas = document.createElement("canvas");
@@ -1233,6 +1264,7 @@ async function loadVideoThumbnail(item) {
 
     const cleanup = () => {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", handleAbort);
       preview.removeEventListener("loadedmetadata", handleMetadata);
       preview.removeEventListener("loadeddata", handleLoadedData);
       preview.removeEventListener("seeked", capture);
@@ -1247,23 +1279,27 @@ async function loadVideoThumbnail(item) {
       callback(value);
     };
     const capture = () => {
-      if (!preview.videoWidth || !preview.videoHeight) return;
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d");
-      context.fillStyle = "#151923";
-      context.fillRect(0, 0, width, height);
-      const scale = Math.min(width / preview.videoWidth, height / preview.videoHeight);
-      const drawWidth = preview.videoWidth * scale;
-      const drawHeight = preview.videoHeight * scale;
-      context.drawImage(
-        preview,
-        (width - drawWidth) / 2,
-        (height - drawHeight) / 2,
-        drawWidth,
-        drawHeight,
-      );
-      finish(resolve, canvas.toDataURL("image/jpeg", 0.84));
+      if (settled || !preview.videoWidth || !preview.videoHeight) return;
+      try {
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext("2d");
+        context.fillStyle = "#151923";
+        context.fillRect(0, 0, width, height);
+        const scale = Math.min(width / preview.videoWidth, height / preview.videoHeight);
+        const drawWidth = preview.videoWidth * scale;
+        const drawHeight = preview.videoHeight * scale;
+        context.drawImage(
+          preview,
+          (width - drawWidth) / 2,
+          (height - drawHeight) / 2,
+          drawWidth,
+          drawHeight,
+        );
+        finish(resolve, canvas.toDataURL("image/jpeg", 0.84));
+      } catch (error) {
+        finish(reject, error);
+      }
     };
     const handleMetadata = () => {
       const duration = Number.isFinite(preview.duration) ? preview.duration : 0;
@@ -1281,6 +1317,7 @@ async function loadVideoThumbnail(item) {
       if (!seeking) capture();
     };
     const handleError = () => finish(reject, new Error("영상 썸네일을 만들 수 없습니다."));
+    const handleAbort = () => finish(reject, signal.reason);
     const timeout = setTimeout(
       () => finish(reject, new Error("영상 썸네일 생성 시간이 초과되었습니다.")),
       8000,
@@ -1293,18 +1330,22 @@ async function loadVideoThumbnail(item) {
     preview.addEventListener("loadeddata", handleLoadedData);
     preview.addEventListener("seeked", capture);
     preview.addEventListener("error", handleError);
+    signal?.addEventListener("abort", handleAbort, { once: true });
     preview.src = media.url;
     preview.load();
   });
 }
 
-async function loadVideoThumbnailCached(item) {
+async function loadVideoThumbnailCached(item, signal) {
   const key = item.path || item.displayPath || item.name;
-  if (videoThumbnailCache.has(key)) return videoThumbnailCache.get(key);
-  const thumbnail = loadVideoThumbnail(item).catch((error) => {
+  if (videoThumbnailCache.has(key)) {
+    const cached = videoThumbnailCache.get(key);
     videoThumbnailCache.delete(key);
-    throw error;
-  });
+    videoThumbnailCache.set(key, cached);
+    return cached;
+  }
+  const thumbnail = await loadVideoThumbnail(item, signal);
+  signal?.throwIfAborted();
   videoThumbnailCache.set(key, thumbnail);
   if (videoThumbnailCache.size > 300) {
     videoThumbnailCache.delete(videoThumbnailCache.keys().next().value);
@@ -1312,44 +1353,79 @@ async function loadVideoThumbnailCached(item) {
   return thumbnail;
 }
 
-async function renderThumbnails() {
-  const sequence = ++thumbnailRenderSequence;
+function stopThumbnailLoading() {
+  thumbnailRenderSequence += 1;
+  thumbnailObserver?.disconnect();
+  thumbnailObserver = null;
+  thumbnailController?.abort();
+  thumbnailController = null;
+}
+
+function renderThumbnails() {
+  stopThumbnailLoading();
+  const sequence = thumbnailRenderSequence;
+  const controller = new AbortController();
+  thumbnailController = controller;
   const items = state.items;
   const strip = $("thumbnailStrip");
   strip.innerHTML = "";
+  const fragment = document.createDocumentFragment();
   items.forEach((item, index) => {
     const element = document.createElement("div");
     element.className = `thumb-item${index === state.index ? " active" : ""}`;
     element.title = item.displayPath || item.path;
     element.dataset.index = String(index);
     element.innerHTML = `<img alt=""><span>${escapeHtml(item.name)}</span>`;
-    element.addEventListener("click", () => {
-      void selectItem(Number(element.dataset.index));
-    });
-    strip.appendChild(element);
+    fragment.appendChild(element);
   });
+  strip.appendChild(fragment);
+  strip.onclick = (event) => {
+    const element = event.target.closest(".thumb-item");
+    if (element) void selectItem(Number(element.dataset.index));
+  };
+  strip.querySelector(".thumb-item.active")?.scrollIntoView({ block: "nearest", inline: "center" });
 
-  const queue = [...strip.children].map((element) => ({
-    element,
-    index: Number(element.dataset.index),
-  })).sort((a, b) => Math.abs(a.index - state.index) - Math.abs(b.index - state.index));
-  const workers = Array.from({ length: Math.min(2, queue.length) }, async () => {
-    while (queue.length) {
-      const { element, index } = queue.shift();
+  const queue = new Set();
+  let running = 0;
+  const pump = () => {
+    if (controller.signal.aborted) return;
+    while (running < 2 && queue.size) {
+      const element = [...queue].sort((a, b) => (
+        Math.abs(Number(a.dataset.index) - state.index) -
+        Math.abs(Number(b.dataset.index) - state.index)
+      ))[0];
+      queue.delete(element);
+      observer.unobserve(element);
+      const index = Number(element.dataset.index);
       const item = items[index];
-      try {
-        const source = isVideoItem(item)
-          ? await loadVideoThumbnailCached(item).catch(() => videoPlaceholderDataUrl(item))
-          : await window.clipView.loadThumbnail(item);
-        if (sequence !== thumbnailRenderSequence || !element.isConnected) return;
-        element.querySelector("img").src = source;
-      } catch {
-        if (sequence !== thumbnailRenderSequence || !element.isConnected) return;
-        element.querySelector("span").textContent = `미리보기 없음 · ${item.name}`;
-      }
+      running += 1;
+      void (async () => {
+        try {
+          const source = isVideoItem(item)
+            ? await loadVideoThumbnailCached(item, controller.signal)
+              .catch(() => videoPlaceholderDataUrl(item))
+            : await window.clipView.loadThumbnail(item);
+          if (sequence !== thumbnailRenderSequence || !element.isConnected) return;
+          element.querySelector("img").src = source;
+        } catch {
+          if (sequence !== thumbnailRenderSequence || !element.isConnected) return;
+          element.querySelector("span").textContent = `미리보기 없음 · ${item.name}`;
+        } finally {
+          running -= 1;
+          pump();
+        }
+      })();
     }
-  });
-  await Promise.all(workers);
+  };
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) queue.add(entry.target);
+      else queue.delete(entry.target);
+    }
+    pump();
+  }, { root: strip, rootMargin: "0px 320px" });
+  thumbnailObserver = observer;
+  [...strip.children].forEach((element) => observer.observe(element));
 }
 
 function startSlideshow() {

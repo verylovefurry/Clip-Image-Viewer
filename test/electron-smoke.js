@@ -100,6 +100,82 @@ function attachElectronSmoke({
         }
       }
 
+      if (process.env.CLIPVIEW_SMOKE_RAPID_NAVIGATION === "1") {
+        const navigation = await mainWindow.webContents.executeJavaScript(`(async () => {
+          if (state.items.length < 3) throw new Error("Rapid navigation needs at least three items");
+          const errors = [];
+          const handleRejection = (event) => errors.push(String(event.reason));
+          window.addEventListener("unhandledrejection", handleRejection);
+          const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          try {
+            toggleThumbnails(true);
+            for (let index = 0; index < 72; index += 1) {
+              moveTo(index < 48 ? 1 : -1);
+              await delay(index % 3 === 0 ? 5 : 55);
+              if (index % 12 === 0) {
+                toggleThumbnails(false);
+                toggleThumbnails(true);
+              }
+            }
+            for (let index = 0; index < 48; index += 1) moveTo(index % 3 ? 1 : -1);
+            const expectedIndex = state.index;
+            let settled = false;
+            for (let attempt = 0; attempt < 200; attempt += 1) {
+              await delay(100);
+              settled = loading.classList.contains("hidden") &&
+                !imageLayer.classList.contains("hidden") &&
+                (state.mediaType === "video"
+                  ? video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !video.paused
+                  : image.complete && image.naturalWidth > 0 && image.alt === currentItem().name);
+              if (settled) break;
+            }
+            if (!settled || state.index !== expectedIndex) {
+              throw new Error("Rapid navigation did not show the last selected item: " + currentItem().name);
+            }
+            if (state.mediaType === "image") {
+              const expected = await window.clipView.loadImage(currentItem(), state.cropMode);
+              if (image.src !== expected.dataUrl || state.imageDataUrl !== expected.dataUrl) {
+                throw new Error("An obsolete image overwrote the last selection");
+              }
+              if (state.layerPreparationStarted) throw new Error("Hidden layer panel started a full render");
+            }
+            if (imageCache.size > 3) throw new Error("Navigation retained obsolete image cache entries");
+            if (errors.length) throw new Error(errors.join("; "));
+            return { moves: 120, index: state.index, name: currentItem().name, cacheEntries: imageCache.size };
+          } finally {
+            toggleThumbnails(false);
+            window.removeEventListener("unhandledrejection", handleRejection);
+          }
+        })()`);
+        title = await mainWindow.webContents.executeJavaScript("document.title");
+        console.log(`Rapid navigation smoke passed: ${JSON.stringify(navigation)}`);
+      }
+
+      if (process.env.CLIPVIEW_SMOKE_THUMBNAIL_WINDOW === "1") {
+        const thumbnails = await mainWindow.webContents.executeJavaScript(`(async () => {
+          toggleThumbnails(true);
+          const strip = document.getElementById("thumbnailStrip");
+          const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const active = strip.querySelector(".thumb-item.active img");
+          for (let attempt = 0; attempt < 100 && !active?.naturalWidth; attempt += 1) await delay(100);
+          if (!active?.naturalWidth) throw new Error("Active thumbnail did not load");
+          const initialCount = strip.querySelectorAll("img[src]").length;
+          if (state.items.length > 30 && initialCount >= state.items.length) {
+            throw new Error("Offscreen thumbnails loaded eagerly");
+          }
+          const last = strip.lastElementChild;
+          last.scrollIntoView({ block: "nearest", inline: "end" });
+          for (let attempt = 0; attempt < 100 && !last.querySelector("img").naturalWidth; attempt += 1) {
+            await delay(100);
+          }
+          if (!last.querySelector("img").naturalWidth) throw new Error("Scrolled thumbnail did not load");
+          toggleThumbnails(false);
+          if (thumbnailObserver || thumbnailController) throw new Error("Hidden thumbnails are still active");
+          return { initialCount, items: state.items.length };
+        })()`);
+        console.log(`Thumbnail window smoke passed: ${JSON.stringify(thumbnails)}`);
+      }
+
       if (process.env.CLIPVIEW_SMOKE_SHELL_THUMBNAIL) {
         const shellThumbnail = await nativeImage.createThumbnailFromPath(
           process.env.CLIPVIEW_SMOKE_SHELL_THUMBNAIL,

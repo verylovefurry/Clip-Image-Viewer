@@ -479,6 +479,17 @@ function getImageWorker() {
   return imageWorker;
 }
 
+async function invokeImageTask(method, args, prefetch = false) {
+  try {
+    const worker = getImageWorker();
+    return await (prefetch ? worker.invokeBackground(method, ...args) : worker.invoke(method, ...args));
+  } catch (error) {
+    // Navigation cancellations are expected, not Electron IPC handler failures.
+    if (error.code === "ERR_IMAGE_REQUEST_CANCELLED") return { cancelled: true };
+    throw error;
+  }
+}
+
 async function comicCollection(cmcPath, targetPath = null) {
   const { loadComicProject } = require("./comic-loader");
   const collection = await loadComicProject(cmcPath);
@@ -496,9 +507,10 @@ async function comicCollection(cmcPath, targetPath = null) {
 }
 
 async function buildCollection(targetPath) {
-  const stat = fs.statSync(targetPath);
+  const stat = await fs.promises.stat(targetPath);
   if (stat.isDirectory()) {
-    const cmcPath = findComicProject(targetPath);
+    const entries = await fs.promises.readdir(targetPath, { withFileTypes: true });
+    const cmcPath = findComicProject(targetPath, entries);
     if (cmcPath) {
       try {
         return await comicCollection(cmcPath);
@@ -506,7 +518,7 @@ async function buildCollection(targetPath) {
         // A damaged project must not block opening ordinary images in the folder.
       }
     }
-    const items = listFolder(targetPath);
+    const items = listFolder(targetPath, entries);
     return { items, index: items.length ? 0 : -1, basePath: targetPath };
   }
 
@@ -525,7 +537,8 @@ async function buildCollection(targetPath) {
   }
 
   const folderPath = path.dirname(targetPath);
-  const cmcPath = findComicProject(folderPath);
+  const entries = await fs.promises.readdir(folderPath, { withFileTypes: true });
+  const cmcPath = findComicProject(folderPath, entries);
   if (cmcPath) {
     try {
       const collection = await comicCollection(cmcPath, targetPath);
@@ -535,7 +548,7 @@ async function buildCollection(targetPath) {
     }
   }
 
-  const items = listFolder(folderPath).filter((item) => item.kind !== "archive");
+  const items = listFolder(folderPath, entries).filter((item) => item.kind !== "archive");
   let index = items.findIndex((item) => path.resolve(item.path) === path.resolve(targetPath));
   if (index < 0) {
     items.push(target);
@@ -1041,23 +1054,24 @@ ipcMain.handle("open-dialog", async (_event, kind) => {
 });
 
 ipcMain.handle("open-path", async (_event, targetPath) => buildCollection(targetPath));
-ipcMain.handle("load-image", async (_event, item, cropMode) => (
-  getImageWorker().invoke("loadImage", item, cropMode)
+ipcMain.handle("set-active-item", (_event, item) => imageWorker?.setActiveItem(item));
+ipcMain.handle("load-image", async (_event, item, cropMode, prefetch) => (
+  invokeImageTask("loadImage", [item, cropMode], prefetch === true)
 ));
 ipcMain.handle("load-thumbnail", async (_event, item) => (
-  getImageWorker().invoke("loadThumbnail", item)
+  invokeImageTask("loadThumbnail", [item])
 ));
 ipcMain.handle("load-layer-thumbnail", async (_event, item, id) => (
-  getImageWorker().invoke("loadLayerThumbnail", item, id)
+  invokeImageTask("loadLayerThumbnail", [item, id])
 ));
 ipcMain.handle("render-layered-image", async (_event, item, visibility) => (
-  getImageWorker().invoke("renderLayeredImage", item, visibility)
+  invokeImageTask("renderLayeredImage", [item, visibility])
 ));
 ipcMain.handle("prepare-layered-image", async (_event, item) => (
-  getImageWorker().invoke("prepareLayeredImage", item)
+  invokeImageTask("prepareLayeredImage", [item])
 ));
 ipcMain.handle("pick-layer", async (_event, item, x, y, visibility) => (
-  getImageWorker().invoke("pickLayer", item, x, y, visibility)
+  invokeImageTask("pickLayer", [item, x, y, visibility])
 ));
 
 ipcMain.handle("media-file-url", async (_event, item) => {
@@ -1067,7 +1081,7 @@ ipcMain.handle("media-file-url", async (_event, item) => {
   if (mediaTypeForPath(item.path) !== "video") {
     throw new Error("동영상 파일이 아닙니다.");
   }
-  const stat = fs.statSync(item.path);
+  const stat = await fs.promises.stat(item.path);
   return {
     url: pathToFileURL(item.path).toString(),
     mime: VIDEO_MIME_TYPES[extensionOf(item.path)] || "",

@@ -13,6 +13,7 @@ const {
   extractClipData,
   extractClipPreview,
   loadImage,
+  loadThumbnail,
   loadLayerThumbnail,
   pickLayer,
   prepareLayeredImage,
@@ -190,6 +191,16 @@ async function run() {
   const metadata = await sharp(extracted).metadata();
   assert.equal(metadata.width, 96);
   assert.equal(metadata.height, 64);
+  const previewOnly = await extractClipData(clipPath, { previewOnly: true });
+  assert.deepEqual(Object.keys(previewOnly), ["preview"]);
+  assert.deepEqual(previewOnly.preview, extracted);
+  const thumbnailItem = { kind: "file", path: clipPath, name: "sample.clip" };
+  const preview = await loadThumbnail(thumbnailItem, 48, 32);
+  assert.equal(await loadThumbnail(thumbnailItem, 48, 32), preview);
+  const previewMetadata = await sharp(Buffer.from(preview.split(",")[1], "base64")).metadata();
+  assert.equal(previewMetadata.width, 48);
+  assert.equal(previewMetadata.height, 32);
+  await assert.rejects(loadThumbnail(thumbnailItem, 999999, 32), /미리보기 크기/);
   const clipData = await extractClipData(clipPath);
   const textLayer = clipData.layerDocument.layers[0];
   assert.equal(textLayer.type, "text");
@@ -283,6 +294,17 @@ async function run() {
   assert.deepEqual(files, ["image2.png", "image10.png", "sample.clip", "sample.mp4"]);
   assert.equal(folderItems.find((item) => item.name === "sample.mp4").mediaType, "video");
   assert(naturalCompare("2.png", "10.png") < 0);
+  const directoryEntries = await fs.promises.readdir(temp, { withFileTypes: true });
+  assert.deepEqual(listFolder(temp, directoryEntries), folderItems);
+
+  const changingItem = { kind: "file", path: path.join(temp, "changing.png"), name: "changing.png" };
+  fs.writeFileSync(changingItem.path, "broken image");
+  await assert.rejects(loadThumbnail(changingItem));
+  fs.writeFileSync(changingItem.path, extracted);
+  const firstThumbnail = await loadThumbnail(changingItem);
+  fs.writeFileSync(changingItem.path, await sharp(extracted).resize(24, 16).png().toBuffer());
+  const secondThumbnail = await loadThumbnail(changingItem);
+  assert.notEqual(firstThumbnail, secondThumbnail, "thumbnail cache tracks changed files");
 
   const page1 = path.join(temp, "page1.clip");
   const page2 = path.join(temp, "page2.clip");

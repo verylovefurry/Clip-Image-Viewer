@@ -2,18 +2,31 @@
 
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+async function invokeImageTask(channel, ...args) {
+  const result = await ipcRenderer.invoke(channel, ...args);
+  if (result?.cancelled) {
+    throw Object.assign(new Error("더 최신 이미지 작업으로 대체되었습니다."), {
+      code: "ERR_IMAGE_REQUEST_CANCELLED",
+    });
+  }
+  return result;
+}
+
 contextBridge.exposeInMainWorld("clipView", {
   openDialog: (kind) => ipcRenderer.invoke("open-dialog", kind),
   openPath: (targetPath) => ipcRenderer.invoke("open-path", targetPath),
-  loadImage: (item, cropMode) => ipcRenderer.invoke("load-image", item, cropMode),
-  loadThumbnail: (item) => ipcRenderer.invoke("load-thumbnail", item),
-  loadLayerThumbnail: (item, id) => ipcRenderer.invoke("load-layer-thumbnail", item, id),
-  renderLayeredImage: (item, visibility) => (
-    ipcRenderer.invoke("render-layered-image", item, visibility)
+  setActiveItem: (item) => ipcRenderer.invoke("set-active-item", item),
+  loadImage: (item, cropMode, prefetch = false) => (
+    invokeImageTask("load-image", item, cropMode, prefetch)
   ),
-  prepareLayeredImage: (item) => ipcRenderer.invoke("prepare-layered-image", item),
+  loadThumbnail: (item) => invokeImageTask("load-thumbnail", item),
+  loadLayerThumbnail: (item, id) => invokeImageTask("load-layer-thumbnail", item, id),
+  renderLayeredImage: (item, visibility) => (
+    invokeImageTask("render-layered-image", item, visibility)
+  ),
+  prepareLayeredImage: (item) => invokeImageTask("prepare-layered-image", item),
   pickLayer: (item, x, y, visibility) => (
-    ipcRenderer.invoke("pick-layer", item, x, y, visibility)
+    invokeImageTask("pick-layer", item, x, y, visibility)
   ),
   mediaFileUrl: (item) => ipcRenderer.invoke("media-file-url", item),
   findSubtitles: (item) => ipcRenderer.invoke("find-subtitles", item),

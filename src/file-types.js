@@ -130,12 +130,14 @@ function mediaTypeForPath(filePath) {
   return "other";
 }
 
+const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
 function naturalCompare(a, b) {
-  return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+  return naturalCollator.compare(a, b);
 }
 
-function listFolder(folderPath) {
-  return fs.readdirSync(folderPath, { withFileTypes: true })
+function listFolder(folderPath, entries = fs.readdirSync(folderPath, { withFileTypes: true })) {
+  return entries
     .filter((entry) => entry.isFile() && BROWSABLE_EXTENSIONS.has(extensionOf(entry.name)))
     .map((entry) => ({
       kind: ARCHIVE_EXTENSIONS.has(extensionOf(entry.name)) ? "archive" : "file",
@@ -146,8 +148,8 @@ function listFolder(folderPath) {
     .sort((a, b) => naturalCompare(a.name, b.name));
 }
 
-function findComicProject(folderPath) {
-  const projects = fs.readdirSync(folderPath, { withFileTypes: true })
+function findComicProject(folderPath, entries = fs.readdirSync(folderPath, { withFileTypes: true })) {
+  const projects = entries
     .filter((entry) => entry.isFile() && PROJECT_EXTENSIONS.has(extensionOf(entry.name)))
     .map((entry) => path.join(folderPath, entry.name))
     .sort((a, b) => naturalCompare(path.basename(a), path.basename(b)));

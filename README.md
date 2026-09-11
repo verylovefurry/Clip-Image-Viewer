@@ -108,8 +108,12 @@ Node.js 22 이상을 권장합니다.
 ```bash
 npm install
 npm test
+npm run test:ui
 npm start
 ```
+
+`test:ui`는 임시 이미지·PSD 64개로 연속 이동과 썸네일 지연 로딩을 검증합니다.
+로컬 CLIP 샘플이 있으면 `npm run test:samples`로 레이어 회귀 테스트도 실행할 수 있습니다.
 
 ```bash
 npm run build
