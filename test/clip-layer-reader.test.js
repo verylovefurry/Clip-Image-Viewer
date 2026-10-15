@@ -5,10 +5,13 @@ const zlib = require("zlib");
 const initSqlJs = require("sql.js");
 const {
   decodeClipLayer,
+  decodeClipLayerForCanvas,
+  decodeClipMaskForCanvas,
   decodeClipVector,
   extractClipBrushStyles,
   extractClipRasterSources,
   extractClipThumbnailSources,
+  extractClipTextSources,
   extractClipVectorSources,
   parseChunkBlocks,
   parseOffscreenAttributes,
@@ -34,10 +37,11 @@ function text(value) {
   return Buffer.concat([u32(value.length), utf16be(value)]);
 }
 
-function makeAttribute() {
+function makeAttribute(options = {}) {
   const packing = Array(16).fill(0);
   packing[1] = 1;
-  packing[2] = 4;
+  packing[2] = options.mask ? 0 : 4;
+  packing[8] = options.bitMask ? 32 : 0;
   return Buffer.concat([
     u32(16),
     u32(102),
@@ -51,21 +55,21 @@ function makeAttribute() {
     ...packing.map(u32),
     text("InitColor"),
     u32(0),
-    u32(0),
+    u32(options.defaultFill || 0),
     u32(0),
     u32(0),
     u32(0),
   ]);
 }
 
-function makeBlockChunk() {
+function makeBlockChunk(pixelData) {
   const tilePixels = 256 * 256;
   const pixels = Buffer.alloc(tilePixels * 5);
   pixels[0] = 255;
   pixels[tilePixels] = 10;
   pixels[tilePixels + 1] = 20;
   pixels[tilePixels + 2] = 30;
-  const compressed = zlib.deflateSync(pixels);
+  const compressed = zlib.deflateSync(pixelData || pixels);
   const block = Buffer.concat([
     u32(0),
     u32(0),
@@ -136,8 +140,10 @@ function makeVectorRecord(x, y, width = 8, pressure = 0, velocity = 0) {
   output.writeUInt32BE(Math.ceil(y + width / 2), 28);
   output.writeUInt32BE(0, 32);
   output.writeFloatBE(pressure, 36);
-  output.writeFloatBE(0.75, 40);
-  output.writeFloatBE(velocity, 44);
+  output.writeFloatBE(velocity, 40);
+  output.writeFloatBE(0.75, 44);
+  output.writeFloatBE(1, 56);
+  output.writeFloatBE(1, 60);
   return output;
 }
 
@@ -148,6 +154,7 @@ function makeVectorStroke(records, baseSize = 3.5, styleId = 2, pointStride = 88
   header.writeUInt32BE(pointStride, 8);
   header.writeUInt32BE(88, 12);
   header.writeUInt32BE(records.length, 16);
+  header.writeDoubleBE(1, 64);
   header.writeUInt32BE(styleId, 76);
   header.writeDoubleBE(baseSize, 80);
   return Buffer.concat([
@@ -184,6 +191,19 @@ async function run() {
   assert.equal(decoded.width, 2);
   assert.equal(decoded.height, 1);
   assert.deepEqual([...decoded.data.subarray(0, 4)], [30, 20, 10, 255]);
+  const level = { attribute, externalId: Buffer.from(externalId).toString("hex"), offset: 0, scale: 100, width: 2, height: 1 };
+  const linear = decodeClipLayerForCanvas(source, [level], 1, 1, { sampling: "linear" });
+  assert.deepEqual([...linear.data], [30, 20, 10, 128], "resize uses premultiplied colour without dark fringes");
+  const bitPixels = Buffer.alloc(256 * 256 / 8);
+  bitPixels[0] = 0x80;
+  const maskLevel = { ...level, attribute: makeAttribute({ mask: true, bitMask: true }) };
+  const bitSource = makeExternalChunk(externalId, makeBlockChunk(bitPixels));
+  assert.deepEqual([...decodeClipMaskForCanvas(bitSource, [maskLevel], 2, 1).data], [255, 0], "1-bit masks use MSB-first coverage");
+  assert.deepEqual([...decodeClipLayerForCanvas(bitSource, [maskLevel], 2, 1, { color: [80, 20, 10] }).data], [80, 20, 10, 255, 80, 20, 10, 0], "1-bit alpha surfaces retain their draw colour");
+  assert.throws(() => decodeClipLayerForCanvas(makeExternalChunk(externalId, makeBlockChunk(Buffer.alloc(1))), [level], 2, 1,
+    { strictTiles: true }), /픽셀 길이/, "a damaged text cache is not silently treated as an empty object");
+  const zeroMaskSource = makeExternalChunk(externalId, makeBlockChunk(Buffer.alloc(bitPixels.length)));
+  assert.deepEqual([...decodeClipMaskForCanvas(zeroMaskSource, [{ ...maskLevel, attribute: makeAttribute({ mask: true, bitMask: true, defaultFill: 1 }) }], 2, 1).data], [0, 0], "an explicitly black tile overrides an initially white mask");
   const emptySource = makeExternalChunk(externalId, makeEmptyBlockChunk());
   assert.equal(decodeClipLayer(emptySource, [{
     attribute,
@@ -219,7 +239,9 @@ async function run() {
     vector.segments.map((segment) => segment.length),
     [2, 2],
   );
-  assert.equal(vector.segments[0][0].width, 4);
+  assert.equal(vector.segments[0][0].width, 8, "stored brush size is a radius");
+  assert.equal(vector.segments[0][0].velocity, 0);
+  assert.equal(vector.segments[0][0].smooth, 0.75);
   assert.deepEqual(
     [vector.segments[0][0].x, vector.segments[0][0].y],
     [20, 24],
@@ -268,10 +290,23 @@ async function run() {
     },
   );
   assert.equal(pressureVector.segments[0][0].pressure, 0.5);
-  assert.equal(pressureVector.segments[0][0].width, 1.75);
-  assert.equal(pressureVector.segments[0][1].width, 3.5);
+  assert.equal(pressureVector.segments[0][0].width, 3.5);
+  assert.equal(pressureVector.segments[0][1].width, 7);
   assert.equal(pressureVector.segments[0][0].thickness, 0.7);
   assert.equal(pressureVector.segments[0][0].rotation, 79);
+
+  const frameHeader = Buffer.alloc(100);
+  [100, 76, 88, 88, 2].forEach((value, index) => frameHeader.writeUInt32BE(value, index * 4));
+  frameHeader.writeDoubleBE(1, 64);
+  frameHeader.writeUInt32BE(1040, 76);
+  frameHeader.writeUInt32BE(2, 80);
+  frameHeader.writeUInt32BE(13, 84);
+  frameHeader.writeDoubleBE(2.5, 88);
+  const extendedFrame = decodeClipVector(makeExternalChunk(vectorId, Buffer.concat([
+    frameHeader, makeVectorRecord(20, 20), makeVectorRecord(30, 30),
+  ])), [{ externalId: Buffer.from(vectorId).toString("hex"), offset: 0 }], 100, 100, { 2: { pressureEnabled: false } });
+  assert.equal(extendedFrame.segments[0][0].width, 5, "extended frame headers store the radius after extra style words");
+  assert.equal(extendedFrame.segments[0][0].brushId, "2");
 
   const SQL = await initSqlJs({
     locateFile: (file) => require.resolve(`sql.js/dist/${file}`),
@@ -285,7 +320,7 @@ async function run() {
   db.run(`CREATE TABLE MipmapInfo (
     MainId INTEGER, ThisScale REAL, Offscreen INTEGER, NextIndex INTEGER
   )`);
-  db.run("CREATE TABLE Offscreen (MainId INTEGER, Attribute BLOB, BlockData BLOB)");
+  db.run("CREATE TABLE Offscreen (MainId INTEGER, Attribute BLOB, BlockData BLOB, LayerId INTEGER)");
   db.run("CREATE TABLE ExternalChunk (ExternalID BLOB, Offset INTEGER)");
   db.run("CREATE TABLE VectorObjectList (LayerId INTEGER, VectorData BLOB)");
   db.run(`CREATE TABLE BrushEffectorGraphData (
@@ -299,7 +334,7 @@ async function run() {
   db.run("INSERT INTO LayerThumbnail VALUES (40, 30)");
   db.run("INSERT INTO Mipmap VALUES (10, 20)");
   db.run("INSERT INTO MipmapInfo VALUES (20, 100, 30, 0)");
-  const offscreenInsert = db.prepare("INSERT INTO Offscreen VALUES (30, ?, ?)");
+  const offscreenInsert = db.prepare("INSERT INTO Offscreen VALUES (30, ?, ?, 7)");
   offscreenInsert.run([attribute, Buffer.from(externalId)]);
   offscreenInsert.free();
   const externalInsert = db.prepare("INSERT INTO ExternalChunk VALUES (?, 0)");
@@ -334,6 +369,11 @@ async function run() {
   const sources = extractClipRasterSources(db);
   const thumbnailSources = extractClipThumbnailSources(db);
   const vectorSources = extractClipVectorSources(db);
+  const textSources = extractClipTextSources(db, [{ id: "7", textObjects: [{ index: 0, attributes: { renderCacheId: 30, bounds: [10, 20, 11, 21] } }] }]);
+  assert.equal(textSources["7"][0].offscreenId, 30);
+  assert.equal(textSources["7"][0].left, 10);
+  assert.equal(textSources["7"][0].top, 20);
+  assert.deepEqual(extractClipTextSources(db, [{ id: "8", textObjects: [{ index: 0, attributes: { renderCacheId: 30, bounds: [10, 20, 11, 21] } }] }]), {}, "never borrow another layer's text cache");
   db.close();
   assert.equal(sources["7"].length, 1);
   assert.equal(sources["7"][0].width, 2);

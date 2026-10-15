@@ -30,6 +30,9 @@ const state = {
   infoVisible: false,
   layersVisible: false,
   layerDocument: null,
+  layerIndex: new Map(),
+  layerParents: new Map(),
+  layerRows: new Map(),
   layerVisibility: {},
   renderedLayerVisibility: {},
   selectedLayerId: "",
@@ -55,7 +58,7 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const stage = $("stage");
 const imageLayer = $("imageLayer");
-const image = $("viewerImage");
+let image = $("viewerImage");
 const video = $("viewerVideo");
 const videoControls = $("videoControls");
 const videoSeek = $("videoSeek");
@@ -70,6 +73,7 @@ const videoSpeedSelect = $("videoSpeedSelect");
 const videoFullscreenBtn = $("videoFullscreenBtn");
 const videoContextMenu = $("videoContextMenu");
 const emptyState = $("emptyState");
+const errorState = $("errorState");
 const loading = $("loading");
 const toast = $("toast");
 let toastTimer;
@@ -82,7 +86,9 @@ let videoControlInteracting = false;
 let thumbnailRenderSequence = 0;
 let thumbnailObserver = null;
 let thumbnailController = null;
+let layerDecodeController = null;
 const imageCache = new Map();
+const MAX_IMAGE_CACHE_BYTES = 160 * 1024 * 1024;
 const videoThumbnailCache = new Map();
 
 function currentItem() {
@@ -135,7 +141,6 @@ function clearVideo() {
 }
 
 function clearImage() {
-  image.removeAttribute("src");
   image.classList.add("hidden");
   state.imageDataUrl = "";
   clearLayerDocument();
@@ -150,8 +155,13 @@ function flattenLayers(layers, output = []) {
 }
 
 function clearLayerDocument() {
+  layerDecodeController?.abort();
+  layerDecodeController = null;
   state.layerThumbnailSequence += 1;
   state.layerDocument = null;
+  state.layerIndex.clear();
+  state.layerParents.clear();
+  state.layerRows.clear();
   state.layerVisibility = {};
   state.renderedLayerVisibility = {};
   state.selectedLayerId = "";
@@ -164,11 +174,15 @@ function clearLayerDocument() {
   $("layerBtn")?.classList.add("hidden");
   $("layerBtn")?.classList.remove("active");
   $("layerTree").replaceChildren();
+  renderLayerDetails();
 }
 
 function setLayerDocument(document) {
   state.layerThumbnailSequence += 1;
   state.layerDocument = document || null;
+  state.layerIndex.clear();
+  state.layerParents.clear();
+  state.layerRows.clear();
   state.layerVisibility = {};
   state.selectedLayerId = "";
   state.layerThumbnails = {};
@@ -179,25 +193,127 @@ function setLayerDocument(document) {
     clearLayerDocument();
     return;
   }
-  flattenLayers(document.layers).forEach((layer) => {
-    state.layerVisibility[layer.id] = layer.visible;
-  });
+  const indexLayers = (layers, parents = []) => {
+    for (const layer of layers || []) {
+      state.layerIndex.set(layer.id, layer);
+      state.layerParents.set(layer.id, parents);
+      state.layerVisibility[layer.id] = Boolean(layer.visible);
+      indexLayers(layer.children, [...parents, layer.id]);
+    }
+  };
+  indexLayers(document.layers);
   state.renderedLayerVisibility = { ...state.layerVisibility };
   $("layerBtn").classList.remove("hidden");
   if (state.layersVisible) renderLayerPanel();
 }
 
 function layerById(id) {
-  return flattenLayers(state.layerDocument?.layers).find((layer) => layer.id === id) || null;
+  return state.layerIndex.get(id) || null;
 }
 
-function layerAncestorIds(layers, id, ancestors = []) {
-  for (const layer of layers || []) {
-    if (layer.id === id) return ancestors;
-    const nested = layerAncestorIds(layer.children, id, [...ancestors, layer.id]);
-    if (nested) return nested;
+function layerIsVisible(id) {
+  return Boolean(state.layerVisibility[id]) &&
+    (state.layerParents.get(id) || []).every((parent) => state.layerVisibility[parent]);
+}
+
+function layerVisibilityLabel(id) {
+  if (!state.layerVisibility[id]) return "꺼짐";
+  return layerIsVisible(id) ? "켜짐" : "켜짐 (상위 폴더가 숨겨짐)";
+}
+
+function updateLayerVisibilityRow(layer) {
+  const row = state.layerRows.get(layer.id);
+  if (!row) return;
+  const visible = Boolean(state.layerVisibility[layer.id]);
+  row.dataset.visible = String(visible);
+  row.dataset.effectiveVisible = String(layerIsVisible(layer.id));
+  row.classList.toggle("layer-inherited-hidden", visible && !layerIsVisible(layer.id));
+  const button = row.querySelector(".layer-visibility");
+  button.classList.toggle("active", visible);
+  button.setAttribute("aria-pressed", String(visible));
+  if (!button.disabled) {
+    button.title = `${visible ? "레이어 숨기기" : "레이어 표시"} · ${layerVisibilityLabel(layer.id)}`;
   }
-  return null;
+}
+
+function refreshLayerVisibility(id) {
+  const layers = id ? flattenLayers([layerById(id)].filter(Boolean)) : state.layerIndex.values();
+  for (const layer of layers) updateLayerVisibilityRow(layer);
+  const detail = $("layerDetailList").querySelector("[data-layer-visibility]");
+  if (detail) detail.textContent = layerVisibilityLabel(state.selectedLayerId);
+}
+
+function layerNumber(value) {
+  return Number.isFinite(value) ? Number(value.toFixed(2)).toLocaleString("ko-KR") : "정보 없음";
+}
+
+function layerColor(color) {
+  if (!Array.isArray(color) || color.length < 3) return "정보 없음";
+  return `#${color.slice(0, 3).map((value) => (
+    Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0")
+  )).join("").toUpperCase()}`;
+}
+
+function layerTextStyle(style) {
+  if (!Number.isFinite(style)) return "정보 없음";
+  return [style & 1 ? "굵게" : "", style & 2 ? "기울임" : "", style & 4 ? "밑줄" : "", style & 8 ? "취소선" : ""]
+    .filter(Boolean).join(", ") || "보통";
+}
+
+function layerTextAlignment(value) {
+  return { 0: "시작", 1: "끝", 2: "가운데" }[value] ||
+    (Number.isFinite(value) ? `정렬 코드 ${value}` : "정보 없음");
+}
+
+function layerTextFonts(attributes) {
+  return [...new Set([
+    attributes.font, ...(attributes.runs || []).map((run) => run.font),
+    ...(attributes.fonts || []).map((font) => font.display || font.internal),
+  ].filter(Boolean))];
+}
+
+function layerDetailHtml(values) {
+  return values.map(([key, value, visibility]) => (
+    `<dt>${escapeHtml(key)}</dt><dd${visibility ? " data-layer-visibility" : ""}>${escapeHtml(String(value))}</dd>`
+  )).join("");
+}
+
+function renderLayerTextObject(object, index) {
+  const attributes = object.attributes || object.extendedAttributes || {};
+  const fonts = layerTextFonts(attributes);
+  const values = [
+    ["글꼴", fonts.join(", ") || "정보 없음"],
+    ["크기", Number.isFinite(attributes.fontSize) ? `${layerNumber(attributes.fontSize / 100)} pt` : "정보 없음"],
+    ["쓰기 방향", Number.isFinite(attributes.style) ? (attributes.vertical ? "세로" : "가로") : "정보 없음"],
+    ["정렬", layerTextAlignment(attributes.align)],
+    ["서식", layerTextStyle(attributes.style)],
+    ["글자색", layerColor(attributes.color)],
+  ];
+  if (attributes.bounds?.length === 4) {
+    const [left, top, right, bottom] = attributes.bounds;
+    values.push(["위치 / 크기", `${left}, ${top} / ${right - left}×${bottom - top} px`]);
+  }
+  if (attributes.edge?.enabled) values.push(["텍스트 테두리", `${layerNumber(attributes.edge.width)} pt · ${layerColor(attributes.edge.color)}`]);
+  if (attributes.background?.enabled) values.push(["텍스트 배경", `${layerColor(attributes.background.color)} · ${layerNumber(attributes.background.opacity / 255 * 100)}%`]);
+  const transforms = [
+    attributes.rotation ? `회전 ${layerNumber(attributes.rotation)}°` : "",
+    attributes.skewX ? `가로 기울기 ${layerNumber(attributes.skewX)}°` : "",
+    attributes.skewY ? `세로 기울기 ${layerNumber(attributes.skewY)}°` : "",
+  ].filter(Boolean);
+  if (transforms.length) values.push(["변형", transforms.join(", ")]);
+  if (attributes.wrapFrame !== undefined) values.push(["텍스트 상자", attributes.wrapFrame ? "상자 안에서 줄바꿈" : "자동 줄바꿈 없음"]);
+  const ranges = (attributes.runs || []).filter((run) => run.length > 0);
+  const rangeHtml = ranges.slice(0, 100).map((run) => {
+    const style = layerTextStyle(run.style);
+    const size = Number.isFinite(run.fontScale) && run.fontScale > 0 ? ` · 크기 ${layerNumber(run.fontScale)}%` : "";
+    return `<li><span>${run.start + 1}–${run.start + run.length}</span><span>${escapeHtml(`${run.font || attributes.font || "기본 글꼴"} · ${style} · ${layerColor(run.color)}${size}`)}</span></li>`;
+  }).join("");
+  return `<article class="layer-text-object">
+    <div class="layer-text-object-heading">객체 ${index + 1}</div>
+    <div class="layer-text-object-content">${escapeHtml(object.text || "(빈 텍스트)")}</div>
+    <dl>${layerDetailHtml(values)}</dl>
+    ${ranges.length ? `<details class="layer-text-ranges"><summary>문자 범위별 서식 ${ranges.length}개</summary><ol>${rangeHtml}</ol>${ranges.length > 100 ? "<p>처음 100개 범위를 표시합니다.</p>" : ""}</details>` : ""}
+  </article>`;
 }
 
 function renderLayerDetails() {
@@ -210,45 +326,52 @@ function renderLayerDetails() {
     textObjectsPanel.innerHTML = "";
     return;
   }
+  panel.scrollTop = 0;
   $("layerDetailName").textContent = layer.name;
   const values = [
     ["종류", layer.typeLabel || (layer.type === "group" ? "그룹" : layer.type)],
+    ["표시", layerVisibilityLabel(layer.id), true],
     ["합성", layer.blendModeLabel || layer.blendMode || "표준"],
-    ["불투명도", `${layer.opacity}%`],
+    ["불투명도", `${layerNumber(layer.opacityExact ?? layer.opacity)}%`],
     ["클리핑", layer.clipping ? "있음" : "없음"],
-    ["마스크", layer.mask ? "있음" : "없음"],
+    ["마스크", layer.mask ? layer.maskVisible === false ? "있음 (해제됨)" : "있음" : "없음"],
     ["효과", layer.effects?.length ? layer.effects.join(", ") : "없음"],
-    ["미리보기", layer.previewAccuracy || "레이어 데이터"],
   ];
+  if (layer.colorMode?.label) values.push(["표현색", `${layer.colorMode.label}${layer.colorMode.index === 2 && layer.colorMode.channelsKnown ? ` · ${[layer.colorMode.black ? "검정" : "", layer.colorMode.white ? "흰색" : ""].filter(Boolean).join("/") || "색상 선택 없음"}` : ""}`]);
   if (layer.type === "text") {
-    values.splice(1, 0, ["텍스트 객체", `${layer.textObjects?.length || 0}개`]);
+    const attributes = (layer.textObjects || []).map((object) => object.attributes || object.extendedAttributes || {});
+    const fonts = [...new Set(attributes.flatMap(layerTextFonts))];
+    const directions = [...new Set(attributes.filter((entry) => Number.isFinite(entry.style)).map((entry) => entry.vertical ? "세로" : "가로"))];
+    const sizes = attributes.map((entry) => entry.fontSize / 100).filter((size) => Number.isFinite(size) && size > 0);
+    values.splice(1, 0,
+      ["텍스트 객체", `${layer.textObjects?.length || 0}개`],
+      ["글꼴", fonts.join(", ") || "정보 없음"],
+      ["쓰기 방향", directions.join(" / ") || "정보 없음"],
+      ["텍스트 크기", sizes.length ? `${layerNumber(Math.min(...sizes))}${Math.min(...sizes) !== Math.max(...sizes) ? `~${layerNumber(Math.max(...sizes))}` : ""} pt` : "정보 없음"],
+    );
   }
-  if (layer.locked) values.push(["잠금", "잠김"]);
-  if (layer.draft) values.push(["속성", "초안 레이어"]);
-  $("layerDetailList").innerHTML = values
-    .map(([key, value]) => `<dt>${key}</dt><dd>${escapeHtml(String(value))}</dd>`)
-    .join("");
+  if (layer.children?.length || layer.type === "group") values.push(["하위 레이어", `${layer.children?.length || 0}개 (전체 ${flattenLayers(layer.children).length}개)`]);
+  if (layer.vectorInfo) {
+    const vector = layer.vectorInfo;
+    const contents = [vector.strokeSourceId ? "선" : "", vector.fillSourceId ? "채우기" : "", vector.objectSourceId ? "도형" : ""].filter(Boolean);
+    values.push(["벡터 구성", contents.join(", ") || "연결 데이터"]);
+    values.push(["벡터 데이터", `${vector.dataCount}개 저장 데이터${vector.kindCode !== null ? ` · 종류 코드 ${vector.kindCode}` : ""}`]);
+  }
+  if (layer.edgeEffect) values.push(["레이어 테두리", `${layerNumber(layer.edgeEffect.width)} px · ${layerColor(layer.edgeEffect.color)}`]);
+  if (layer.toneEffect) values.push(["톤", `${layerNumber(layer.toneEffect.frequency)}선 · ${layerNumber(layer.toneEffect.angle)}°`]);
+  for (const [key, storage] of [["저장 래스터", layer.storedRaster], ["저장 마스크", layer.storedMask], ["소재 원본", layer.storedObject]]) {
+    if (storage) values.push([key, `${storage.width}×${storage.height} px · ${storage.levels}단계`]);
+  }
+  if (layer.offsetX !== undefined && layer.offsetY !== undefined) values.push(["레이어 위치", `${layer.offsetX}, ${layer.offsetY} px`]);
+  if (layer.paletteColor) values.push(["목록 색상", layerColor(layer.paletteColor)]);
+  const properties = [layer.locked ? "편집 잠금" : "", layer.alphaLocked ? "투명 픽셀 잠금" : "", layer.draft ? "밑그림" : "", layer.hasRuler ? "자" : ""].filter(Boolean);
+  if (properties.length) values.push(["속성", properties.join(", ")]);
+  values.push(["미리보기", layer.previewAccuracy || "레이어 데이터"]);
+  if (layer.classificationSource) values.push(["판별 근거", layer.classificationSource]);
+  $("layerDetailList").innerHTML = layerDetailHtml(values);
   const textObjects = layer.textObjects || [];
   textObjectsPanel.classList.toggle("hidden", !textObjects.length);
-  textObjectsPanel.innerHTML = textObjects.map((object, index) => {
-    const attributes = object.attributes || {};
-    const fontSize = Number.isFinite(attributes.fontSize)
-      ? `${attributes.fontSize / 100} pt`
-      : "크기 정보 없음";
-    const bounds = attributes.bounds?.length === 4
-      ? `${attributes.bounds[0]}, ${attributes.bounds[1]} · ${
-          attributes.bounds[2] - attributes.bounds[0]
-        }×${attributes.bounds[3] - attributes.bounds[1]}`
-      : "위치 정보 없음";
-    return `
-      <article class="layer-text-object">
-        <div class="layer-text-object-heading">객체 ${index + 1}</div>
-        <div class="layer-text-object-content">${escapeHtml(object.text || "(빈 텍스트)")}</div>
-        <div class="layer-text-object-meta">${escapeHtml(
-          `${attributes.font || "글꼴 정보 없음"} · ${fontSize} · ${bounds}`,
-        )}</div>
-      </article>`;
-  }).join("");
+  textObjectsPanel.innerHTML = textObjects.map(renderLayerTextObject).join("");
 }
 
 function renderLayerPanel() {
@@ -256,7 +379,8 @@ function renderLayerPanel() {
   if (!layerDocument) return;
   $("layerHelp").textContent = layerDocument.note || "";
   const tree = $("layerTree");
-  tree.innerHTML = "";
+  tree.replaceChildren();
+  state.layerRows.clear();
   const append = (layers, depth = 0) => {
     for (const layer of layers || []) {
       const isGroup = layer.type === "group" || Boolean(layer.children?.length);
@@ -267,6 +391,8 @@ function renderLayerPanel() {
       element.style.setProperty("--layer-depth", String(depth));
       element.dataset.layerId = layer.id;
       element.dataset.layerType = layer.type;
+      element.dataset.layerKind = layer.kind || layer.type;
+      state.layerRows.set(layer.id, element);
 
       const visibility = document.createElement("button");
       visibility.type = "button";
@@ -276,8 +402,10 @@ function renderLayerPanel() {
       const toggleAvailable = layerDocument.toggleSupported && layer.toggleAvailable !== false;
       visibility.title = toggleAvailable
         ? (state.layerVisibility[layer.id] ? "레이어 숨기기" : "레이어 표시")
-        : "CSP 전용 렌더러가 필요한 레이어입니다.";
+        : "독립 합성 가능한 미리보기 데이터가 없습니다.";
       visibility.disabled = !toggleAvailable;
+      visibility.setAttribute("aria-label", `${layer.name} 표시`);
+      visibility.setAttribute("aria-pressed", String(Boolean(state.layerVisibility[layer.id])));
       visibility.addEventListener("click", (event) => {
         event.stopPropagation();
         void toggleLayerVisibility(layer.id);
@@ -299,6 +427,7 @@ function renderLayerPanel() {
           if (collapsed) state.collapsedLayerIds.delete(layer.id);
           else state.collapsedLayerIds.add(layer.id);
           renderLayerPanel();
+          state.layerRows.get(layer.id)?.querySelector(".layer-folder-toggle")?.focus({ preventScroll: true });
         };
         visual.addEventListener("click", toggleFolder);
       } else if (
@@ -323,16 +452,21 @@ function renderLayerPanel() {
       const name = document.createElement("button");
       name.type = "button";
       name.className = "layer-name";
+      const properties = [layer.clipping ? "클리핑" : "", layer.mask ? layer.maskVisible === false ? "마스크 해제" : "마스크" : "", ...(layer.effects || []), layer.locked ? "잠금" : "", layer.alphaLocked ? "투명 픽셀 잠금" : "", layer.draft ? "밑그림" : "", layer.hasRuler ? "자" : ""].filter(Boolean);
+      name.title = [layer.name, layer.typeLabel || layer.type, ...properties].join(" · ");
+      name.setAttribute("aria-pressed", String(state.selectedLayerId === layer.id));
       name.innerHTML = `
         <span class="layer-title">${escapeHtml(layer.name)}</span>
-        <span class="layer-meta">${layer.opacity}% · ${
+        <span class="layer-meta"><span class="layer-kind">${escapeHtml(layer.typeLabel || (isGroup ? "폴더" : "레이어"))}</span> · ${layer.opacity}% · ${
           escapeHtml(layer.blendModeLabel || layer.blendMode || "표준")
         }</span>
+        ${properties.length ? `<span class="layer-properties">${escapeHtml(properties.join(" · "))}</span>` : ""}
       `;
       name.addEventListener("click", () => selectLayer(layer.id));
 
       element.append(visibility, visual, name);
       tree.appendChild(element);
+      updateLayerVisibilityRow(layer);
       if (!isGroup || !state.collapsedLayerIds.has(layer.id)) {
         append(layer.children, depth + 1);
       }
@@ -395,21 +529,34 @@ async function ensureLayerThumbnails() {
 }
 
 function selectLayer(id) {
+  if (!layerById(id)) return;
+  const previous = state.selectedLayerId;
   state.selectedLayerId = id;
-  layerAncestorIds(state.layerDocument?.layers, id)?.forEach((ancestorId) => {
+  let expanded = false;
+  (state.layerParents.get(id) || []).forEach((ancestorId) => {
+    if (state.collapsedLayerIds.has(ancestorId)) expanded = true;
     state.collapsedLayerIds.delete(ancestorId);
   });
-  renderLayerPanel();
-  document.querySelector(`.layer-row[data-layer-id="${CSS.escape(id)}"]`)
-    ?.scrollIntoView({ block: "nearest" });
+  if (expanded) renderLayerPanel();
+  else {
+    state.layerRows.get(previous)?.classList.remove("selected");
+    state.layerRows.get(previous)?.querySelector(".layer-name")?.setAttribute("aria-pressed", "false");
+    state.layerRows.get(id)?.classList.add("selected");
+    state.layerRows.get(id)?.querySelector(".layer-name")?.setAttribute("aria-pressed", "true");
+    renderLayerDetails();
+  }
+  state.layerRows.get(id)?.scrollIntoView({ block: "nearest" });
 }
 
 async function toggleLayerVisibility(id) {
   const layer = layerById(id);
-  if (!state.layerDocument?.toggleSupported || layer?.toggleAvailable === false) return;
+  if (!layer || !state.layerDocument?.toggleSupported || layer.toggleAvailable === false) return;
   state.layerVisibility[id] = !state.layerVisibility[id];
-  renderLayerPanel();
+  refreshLayerVisibility(id);
   const sequence = ++state.layerRenderSequence;
+  layerDecodeController?.abort();
+  const decodeController = new AbortController();
+  layerDecodeController = decodeController;
   const loadingTimer = setTimeout(() => {
     if (sequence === state.layerRenderSequence) loading.classList.remove("hidden");
   }, 150);
@@ -419,13 +566,11 @@ async function toggleLayerVisibility(id) {
       state.layerVisibility,
     );
     if (sequence !== state.layerRenderSequence) return;
-    await decodeImage(result.dataUrl);
+    const prepared = await decodeImage(result.dataUrl, decodeController.signal);
     if (sequence !== state.layerRenderSequence) return;
+    presentImage(prepared, currentItem().name);
     state.imageDataUrl = result.dataUrl;
     state.metadata = result.metadata;
-    image.src = result.dataUrl;
-    await image.decode();
-    if (sequence !== state.layerRenderSequence) return;
     state.naturalWidth = image.naturalWidth;
     state.naturalHeight = image.naturalHeight;
     state.renderedLayerVisibility = { ...state.layerVisibility };
@@ -435,7 +580,7 @@ async function toggleLayerVisibility(id) {
   } catch (error) {
     if (sequence === state.layerRenderSequence) {
       state.layerVisibility = { ...state.renderedLayerVisibility };
-      renderLayerPanel();
+      refreshLayerVisibility();
       showToast(error?.message || "레이어 표시를 변경하지 못했습니다.", true);
     }
   } finally {
@@ -617,38 +762,108 @@ function adjacentIndices(index = state.index) {
   return [...new Set(indices)];
 }
 
-async function decodeImage(dataUrl) {
-  const preloadImage = new Image();
-  preloadImage.src = dataUrl;
-  if (preloadImage.decode) {
-    await preloadImage.decode();
-    return;
-  }
-  await new Promise((resolve, reject) => {
-    preloadImage.onload = resolve;
-    preloadImage.onerror = reject;
+function imageLoadCancelled() {
+  return Object.assign(new Error("이미지 불러오기가 취소되었습니다."), {
+    code: "ERR_IMAGE_REQUEST_CANCELLED",
   });
+}
+
+async function decodeImage(dataUrl, signal) {
+  if (signal?.aborted) throw imageLoadCancelled();
+  const preloadImage = new Image();
+  preloadImage.decoding = "async";
+  preloadImage.draggable = false;
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      preloadImage.onload = null;
+      preloadImage.onerror = null;
+      signal?.removeEventListener("abort", cancel);
+    };
+    const cancel = () => {
+      cleanup();
+      preloadImage.removeAttribute("src");
+      reject(imageLoadCancelled());
+    };
+    preloadImage.onload = () => { cleanup(); resolve(); };
+    preloadImage.onerror = () => {
+      cleanup();
+      reject(new Error("이미지 데이터를 표시할 수 없습니다. 파일이 손상되었거나 지원하지 않는 형식일 수 있습니다."));
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+    preloadImage.src = dataUrl;
+  });
+  const cancelDecode = () => preloadImage.removeAttribute("src");
+  signal?.addEventListener("abort", cancelDecode, { once: true });
+  try {
+    if (signal?.aborted) throw imageLoadCancelled();
+    if (preloadImage.decode) await preloadImage.decode();
+  } catch (error) {
+    if (signal?.aborted) throw imageLoadCancelled();
+    // A loaded image remains usable if Chromium cancels a redundant decode.
+    if (!preloadImage.complete || !preloadImage.naturalWidth) throw error;
+  } finally {
+    signal?.removeEventListener("abort", cancelDecode);
+  }
+  if (signal?.aborted) throw imageLoadCancelled();
+  return preloadImage;
+}
+
+function presentImage(prepared, name) {
+  if (prepared === image) return;
+  const previous = image;
+  prepared.id = "viewerImage";
+  prepared.alt = name;
+  previous.replaceWith(prepared);
+  previous.removeAttribute("id");
+  image = prepared;
+  if (![...imageCache.values()].some((entry) => entry.result?.element === previous)) {
+    previous.removeAttribute("src");
+  }
+}
+
+function releaseImageEntry(key) {
+  const entry = imageCache.get(key);
+  if (!entry) return;
+  imageCache.delete(key);
+  entry.controller.abort();
+  if (entry.result?.element !== image) entry.result?.element.removeAttribute("src");
+}
+
+function clearImageCache() {
+  for (const key of imageCache.keys()) releaseImageEntry(key);
+}
+
+function trimImageCache() {
+  const currentKey = imageKey(state.index);
+  let bytes = [...imageCache.values()].reduce((sum, entry) => sum + (entry.bytes || 0), 0);
+  for (const [key, entry] of imageCache) {
+    if (bytes <= MAX_IMAGE_CACHE_BYTES) break;
+    if (key === currentKey) continue;
+    bytes -= entry.bytes || 0;
+    releaseImageEntry(key);
+  }
 }
 
 function loadImageCached(index, prefetch = false) {
   const key = imageKey(index);
   const existing = imageCache.get(key);
-  if (existing?.result) return Promise.resolve(existing.result);
+  if (existing?.result?.element.naturalWidth) return Promise.resolve(existing.result);
   if (existing && prefetch) return existing.promise;
   const item = state.items[index];
   if (isVideoItem(item)) return Promise.reject(new Error("이미지 파일이 아닙니다."));
-  const entry = { result: null, promise: null };
+  releaseImageEntry(key);
+  const entry = { result: null, promise: null, controller: new AbortController(), bytes: 0 };
   // Reissue a pending prefetch as foreground work; the worker deduplicates and promotes it.
   entry.promise = window.clipView.loadImage(item, state.cropMode, prefetch)
     .then(async (result) => {
-      if (imageCache.get(key) === entry) {
-        await decodeImage(result.dataUrl);
-        entry.result = result;
-      }
-      return result;
+      const element = await decodeImage(result.dataUrl, entry.controller.signal);
+      entry.result = { ...result, element };
+      entry.bytes = element.naturalWidth * element.naturalHeight * 4 * (result.metadata.pages || 1) + result.dataUrl.length * 2;
+      trimImageCache();
+      return entry.result;
     })
     .catch((error) => {
-      if (imageCache.get(key) === entry) imageCache.delete(key);
+      if (imageCache.get(key) === entry) releaseImageEntry(key);
       throw error;
     });
   imageCache.set(key, entry);
@@ -660,12 +875,14 @@ function pruneImageCache() {
     [state.index, ...adjacentIndices()].map((index) => imageKey(index)),
   );
   for (const key of imageCache.keys()) {
-    if (!keep.has(key)) imageCache.delete(key);
+    if (!keep.has(key)) releaseImageEntry(key);
   }
 }
 
 function preloadAdjacentImages() {
   pruneImageCache();
+  const current = imageCache.get(imageKey(state.index));
+  if (current?.bytes > MAX_IMAGE_CACHE_BYTES / 2) return;
   for (const index of adjacentIndices()) {
     if (isVideoItem(state.items[index])) continue;
     void loadImageCached(index, true).catch(() => {});
@@ -892,6 +1109,10 @@ function applyTransform() {
   image.style.transform = state.mediaType === "image" ? transform : "";
   video.style.transform = state.mediaType === "video" ? transform : "";
   $("zoomLabel").textContent = `${Math.round(state.zoom * 100)}%`;
+  for (const [id, active] of [["fitBtn", state.fitMode], ["actualBtn", !state.fitMode && state.zoom === 1]]) {
+    $(id).classList.toggle("active", active && hasMedia());
+    $(id).setAttribute("aria-pressed", String(active && hasMedia()));
+  }
 }
 
 function calculateFitZoom() {
@@ -980,7 +1201,9 @@ function escapeHtml(value) {
 
 function updateUi() {
   const item = currentItem();
-  $("fileTitle").textContent = item?.name || "미디어를 열어주세요";
+  const ready = hasMedia() && stage.getAttribute("aria-busy") !== "true";
+  $("fileTitle").textContent = item?.name || "열린 파일 없음";
+  $("fileTitle").title = item?.displayPath || item?.path || "";
   document.title = item ? `${item.name} - Clip Image Viewer` : "Clip Image Viewer";
   $("counter").textContent = state.items.length ? `${state.index + 1} / ${state.items.length}` : "0 / 0";
   $("dimensionLabel").textContent = state.metadata?.width
@@ -988,26 +1211,59 @@ function updateUi() {
     : "-";
   $("prevOverlay").classList.toggle("hidden", state.items.length < 2);
   $("nextOverlay").classList.toggle("hidden", state.items.length < 2);
+  $("prevBtn").disabled = $("prevOverlay").disabled = state.items.length < 2 ||
+    (!state.settings.loop && state.index === 0);
+  $("nextBtn").disabled = $("nextOverlay").disabled = state.items.length < 2 ||
+    (!state.settings.loop && state.index === state.items.length - 1);
+  $("thumbBtn").disabled = !state.items.length;
+  $("infoBtn").disabled = !state.items.length;
   const showCropModes = !isVideoItem(item) && Boolean(state.comic?.cropAvailable);
   $("cropModeSelect").classList.toggle("hidden", !showCropModes);
   $("cropModeSelect").value = state.cropMode;
+  $("copyImageBtn").disabled = $("saveImageBtn").disabled = !state.imageDataUrl || !ready;
+  for (const id of ["zoomOutBtn", "zoomInBtn", "fitBtn", "actualBtn", "rotateLeftBtn", "rotateRightBtn", "flipBtn", "slideshowBtn"]) {
+    $(id).disabled = !ready;
+  }
+  $("slideshowBtn").disabled = !ready && !state.slideshowTimer;
   if (state.infoVisible) updateInfoPanel();
 
   const strip = $("thumbnailStrip");
   const previousThumb = strip.querySelector(".thumb-item.active");
   const activeThumb = strip.children[state.index];
   if (previousThumb !== activeThumb) {
+    const thumbnailFocused = document.activeElement?.classList.contains("thumb-item");
     previousThumb?.classList.remove("active");
+    previousThumb?.setAttribute("aria-current", "false");
+    if (previousThumb) previousThumb.tabIndex = -1;
     activeThumb?.classList.add("active");
+    activeThumb?.setAttribute("aria-current", "true");
+    if (activeThumb) activeThumb.tabIndex = 0;
+    if (thumbnailFocused) activeThumb?.focus({ preventScroll: true });
     if (state.thumbsVisible) {
       activeThumb?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
     }
   }
 }
 
+function showMediaError(item, error) {
+  emptyState.classList.add("hidden");
+  $("errorFile").textContent = item.name;
+  $("errorFile").title = item.displayPath || item.path || "";
+  $("errorDetail").textContent = error?.name === "EncodingError"
+    ? "이미지 표시를 완료하지 못했습니다. 다시 시도하거나 다음 파일로 이동하세요."
+    : error?.message || "파일을 읽을 수 없습니다. 다시 시도하거나 다음 파일로 이동하세요.";
+  $("skipFileBtn").disabled = state.items.length < 2;
+  errorState.classList.remove("hidden");
+  state.metadata = null;
+  updateUi();
+}
+
 async function loadCurrent() {
   const item = currentItem();
   if (!item) return;
+  errorState.classList.add("hidden");
+  stage.setAttribute("aria-busy", "true");
+  updateUi();
   void window.clipView.setActiveItem(item).catch(() => {});
   pruneImageCache();
   if (isVideoItem(item)) {
@@ -1032,6 +1288,7 @@ async function loadCurrentImage(item) {
   try {
     const result = await loadImageCached(state.index);
     if (sequence !== loadSequence) return;
+    presentImage(result.element, item.name);
     state.imageDataUrl = result.dataUrl;
     state.metadata = result.metadata;
     setLayerDocument(result.layerDocument);
@@ -1041,9 +1298,6 @@ async function loadCurrentImage(item) {
     state.panY = 0;
     state.fitMode = true;
 
-    image.src = result.dataUrl;
-    await image.decode();
-    if (sequence !== loadSequence) return;
     state.naturalWidth = image.naturalWidth;
     state.naturalHeight = image.naturalHeight;
     image.alt = item.name;
@@ -1057,10 +1311,13 @@ async function loadCurrentImage(item) {
     state.imageDataUrl = "";
     state.mediaType = "";
     imageLayer.classList.add("hidden");
-    emptyState.classList.remove("hidden");
-    showToast(error?.message || "이미지를 열지 못했습니다.", true);
+    showMediaError(item, error);
   } finally {
-    if (sequence === loadSequence) loading.classList.add("hidden");
+    if (sequence === loadSequence) {
+      loading.classList.add("hidden");
+      stage.setAttribute("aria-busy", "false");
+      updateUi();
+    }
   }
 }
 
@@ -1152,10 +1409,13 @@ async function loadCurrentVideo(item) {
     videoControls.classList.add("hidden");
     imageLayer.classList.remove("video-active");
     imageLayer.classList.add("hidden");
-    emptyState.classList.remove("hidden");
-    showToast(error?.message || "동영상을 열지 못했습니다.", true);
+    showMediaError(item, error);
   } finally {
-    if (sequence === loadSequence) loading.classList.add("hidden");
+    if (sequence === loadSequence) {
+      loading.classList.add("hidden");
+      stage.setAttribute("aria-busy", "false");
+      updateUi();
+    }
   }
 }
 
@@ -1174,7 +1434,7 @@ async function openPath(targetPath) {
     state.index = collection.index;
     selectionSequence += 1;
     state.comic = collection.comic || null;
-    imageCache.clear();
+    clearImageCache();
     stopThumbnailLoading();
     videoThumbnailCache.clear();
     $("thumbnailStrip").innerHTML = "";
@@ -1197,6 +1457,7 @@ async function selectItem(index, options = {}) {
   state.layerRenderSequence += 1;
   cancelPendingVideoLoad?.();
   state.index = index;
+  stage.setAttribute("aria-busy", "true");
   clearLayerDocument();
   void window.clipView.setActiveItem(currentItem()).catch(() => {});
   pruneImageCache();
@@ -1223,6 +1484,7 @@ function toggleInfo(force) {
   state.infoVisible = force ?? !state.infoVisible;
   $("infoPanel").classList.toggle("hidden", !state.infoVisible);
   $("infoBtn").classList.toggle("active", state.infoVisible);
+  $("infoBtn").setAttribute("aria-expanded", String(state.infoVisible));
   if (state.infoVisible) updateInfoPanel();
   if (state.infoVisible && state.layersVisible) toggleLayers(false);
   setTimeout(() => state.fitMode && fitImage(), 0);
@@ -1232,6 +1494,7 @@ function toggleThumbnails(force) {
   state.thumbsVisible = force ?? !state.thumbsVisible;
   $("thumbnailPanel").classList.toggle("hidden", !state.thumbsVisible);
   $("thumbBtn").classList.toggle("active", state.thumbsVisible);
+  $("thumbBtn").setAttribute("aria-expanded", String(state.thumbsVisible));
   if (state.thumbsVisible) renderThumbnails();
   else stopThumbnailLoading();
   setTimeout(() => state.fitMode && fitImage(), 0);
@@ -1371,7 +1634,10 @@ function renderThumbnails() {
   strip.innerHTML = "";
   const fragment = document.createDocumentFragment();
   items.forEach((item, index) => {
-    const element = document.createElement("div");
+    const element = document.createElement("button");
+    element.type = "button";
+    element.tabIndex = index === state.index ? 0 : -1;
+    element.setAttribute("aria-current", String(index === state.index));
     element.className = `thumb-item${index === state.index ? " active" : ""}`;
     element.title = item.displayPath || item.path;
     element.dataset.index = String(index);
@@ -1432,7 +1698,7 @@ function startSlideshow() {
   if (state.items.length < 2) return;
   stopSlideshow();
   $("slideshowBtn").classList.add("active");
-  $("slideshowBtn").textContent = "정지";
+  $("slideshowBtn").textContent = "슬라이드쇼 중지";
   state.slideshowTimer = setInterval(
     () => moveTo(1, { stopSlideshow: false, immediate: true }),
     state.settings.slideInterval,
@@ -1443,7 +1709,7 @@ function stopSlideshow() {
   clearInterval(state.slideshowTimer);
   state.slideshowTimer = null;
   $("slideshowBtn")?.classList.remove("active");
-  if ($("slideshowBtn")) $("slideshowBtn").textContent = "재생";
+  if ($("slideshowBtn")) $("slideshowBtn").textContent = "슬라이드쇼";
 }
 
 async function toggleFullscreen() {
@@ -1579,6 +1845,7 @@ async function initializeRuntimeInfo() {
     renderAssociationOptions();
   }
   const supported = state.runtime.associationSupported;
+  $("settingsVersion").textContent = `Clip Image Viewer ${state.runtime.version}`;
   $("associationControls").classList.toggle("hidden", !supported);
   if (state.runtime.isPortable) {
     $("associationHelp").textContent =
@@ -1639,12 +1906,72 @@ function openSettings() {
   void initializeRuntimeInfo();
 }
 
+function selectSettingsPage(page, focus = false) {
+  document.querySelectorAll("[data-settings-page]").forEach((tab) => {
+    const selected = tab.dataset.settingsPage === page;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    if (selected && focus) tab.focus();
+  });
+  document.querySelectorAll("[data-settings-panel]").forEach((panel) => {
+    panel.classList.toggle("hidden", panel.dataset.settingsPanel !== page);
+  });
+}
+
+async function copyCurrentImage() {
+  if (stage.getAttribute("aria-busy") === "true") return;
+  try {
+    const dataUrl = transformedPngDataUrl();
+    if (!dataUrl) return;
+    await window.clipView.copyImage(dataUrl);
+    showToast("이미지를 클립보드에 복사했습니다.");
+  } catch (error) {
+    showToast(error?.message || "이미지를 복사하지 못했습니다.", true);
+  }
+}
+
+async function saveCurrentImage() {
+  if (stage.getAttribute("aria-busy") === "true") return;
+  try {
+    const dataUrl = transformedPngDataUrl();
+    if (!dataUrl) return;
+    const stem = currentItem().name.replace(/\.[^.]+$/, "");
+    await window.clipView.saveImageCopy(dataUrl, `${stem}.png`);
+  } catch (error) {
+    showToast(error?.message || "이미지를 저장하지 못했습니다.", true);
+  }
+}
+
 function bindActions() {
   const chooseAndOpen = async (kind) => openPath(await window.clipView.openDialog(kind));
   $("openFileBtn").onclick = () => chooseAndOpen("file");
   $("emptyOpenFileBtn").onclick = () => chooseAndOpen("file");
   $("openFolderBtn").onclick = () => chooseAndOpen("folder");
   $("emptyOpenFolderBtn").onclick = () => chooseAndOpen("folder");
+  $("retryFileBtn").onclick = () => {
+    releaseImageEntry(imageKey(state.index));
+    void loadCurrent();
+  };
+  $("skipFileBtn").onclick = () => moveTo(1);
+  $("copyImageBtn").onclick = copyCurrentImage;
+  $("saveImageBtn").onclick = saveCurrentImage;
+  $("viewerTools").addEventListener("click", (event) => {
+    if (event.target.closest("button")) $("viewerTools").open = false;
+  });
+  const settingsTabs = [...document.querySelectorAll("[data-settings-page]")];
+  settingsTabs.forEach((tab, index) => {
+    tab.onclick = () => selectSettingsPage(tab.dataset.settingsPage);
+    tab.onkeydown = (event) => {
+      let next;
+      if (["ArrowDown", "ArrowRight"].includes(event.key)) next = (index + 1) % settingsTabs.length;
+      else if (["ArrowUp", "ArrowLeft"].includes(event.key)) next = (index - 1 + settingsTabs.length) % settingsTabs.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = settingsTabs.length - 1;
+      if (next === undefined) return;
+      event.preventDefault();
+      selectSettingsPage(settingsTabs[next].dataset.settingsPage, true);
+    };
+  });
   $("prevBtn").onclick = $("prevOverlay").onclick = () => moveTo(-1);
   $("nextBtn").onclick = $("nextOverlay").onclick = () => moveTo(1);
   $("zoomOutBtn").onclick = () => zoomBy(1 / 1.18);
@@ -1709,7 +2036,7 @@ function bindActions() {
   $("cropModeSelect").onchange = (event) => {
     state.cropMode = event.target.value;
     localStorage.setItem("cropMode", state.cropMode);
-    imageCache.clear();
+    clearImageCache();
     event.target.blur();
     stage.focus({ preventScroll: true });
     void loadCurrent();
@@ -1719,6 +2046,7 @@ function bindActions() {
     const active = !$("pinBtn").classList.contains("active");
     await window.clipView.setAlwaysOnTop(active);
     $("pinBtn").classList.toggle("active", active);
+    $("pinBtn").setAttribute("aria-pressed", String(active));
   };
 
   $("backgroundSelect").onchange = (event) => {
@@ -1734,6 +2062,7 @@ function bindActions() {
   $("loopCheckbox").onchange = (event) => {
     state.settings.loop = event.target.checked;
     localStorage.setItem("loop", String(state.settings.loop));
+    updateUi();
   };
   $("applyAssociationBtn").onclick = async () => {
     try {
@@ -1888,6 +2217,7 @@ window.addEventListener("pointercancel", () => {
 
 window.addEventListener("click", (event) => {
   if (!event.target.closest(".video-context-menu")) hideVideoContextMenu();
+  if (!event.target.closest(".viewer-tools")) $("viewerTools").open = false;
 });
 
 window.addEventListener("resize", () => {
@@ -1897,29 +2227,23 @@ window.addEventListener("resize", () => {
 window.addEventListener("keydown", async (event) => {
   if ($("settingsDialog").open) return;
   const key = event.key.toLowerCase();
+  if ([" ", "enter"].includes(key) && event.target.closest?.("summary")) return;
   if (handleVideoShortcut(event, key)) {
     return;
   }
   const formControl = event.target.closest?.("input, select, textarea");
   if (formControl && formControl.id !== "cropModeSelect") return;
+  if ([" ", "enter"].includes(key) && event.target.closest?.("button")) return;
   if (event.ctrlKey && key === "o") {
     event.preventDefault();
     const kind = event.shiftKey ? "folder" : "file";
     openPath(await window.clipView.openDialog(kind));
   } else if (event.ctrlKey && key === "c") {
     event.preventDefault();
-    const dataUrl = transformedPngDataUrl();
-    if (dataUrl) {
-      await window.clipView.copyImage(dataUrl);
-      showToast("이미지를 클립보드에 복사했습니다.");
-    }
+    await copyCurrentImage();
   } else if (event.ctrlKey && key === "s") {
     event.preventDefault();
-    const dataUrl = transformedPngDataUrl();
-    if (dataUrl) {
-      const stem = currentItem().name.replace(/\.[^.]+$/, "");
-      await window.clipView.saveImageCopy(dataUrl, `${stem}.png`);
-    }
+    await saveCurrentImage();
   } else if (event.ctrlKey || event.altKey || event.metaKey) {
     return;
   } else if (["arrowleft", "pageup"].includes(key)) {
@@ -1954,7 +2278,10 @@ window.addEventListener("keydown", async (event) => {
     event.preventDefault();
     toggleFullscreen();
   } else if (key === "escape") {
-    if (!videoContextMenu.classList.contains("hidden")) {
+    if ($("viewerTools").open) {
+      $("viewerTools").open = false;
+      $("viewerTools").querySelector("summary").focus();
+    } else if (!videoContextMenu.classList.contains("hidden")) {
       hideVideoContextMenu();
     } else if (state.fullscreen) {
       toggleFullscreen();

@@ -8,9 +8,10 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node test/file-types.test.js && node test/clip-layer-reader.test.js && node test/image-loader.test.js && node test/image-worker.test.js && node test/window-state.test.js && node test/updater.test.js",
+    "test": "node test/file-types.test.js && node test/clip-layer-reader.test.js && node test/clip-layer-metadata.test.js && node test/clip-compositor.test.js && node test/clip-renderer.test.js && node test/image-loader.test.js && node test/image-worker.test.js && node test/window-state.test.js && node test/updater.test.js",
     "test:samples": "node test/clip-samples.test.js",
     "test:ui": "node test/navigation-smoke.js",
+    "test:layers": "node test/layer-ui-smoke.js",
     "licenses": "node scripts/collect-licenses.js",
     "icon": "node scripts/make-icon.js",
     "build": "npm run build:release",
@@ -51,6 +52,7 @@
       "build/icon.png",
       "package.json",
       "README.md",
+      "docs/CLIP_RENDERING.md",
       "LICENSE",
       "THIRD_PARTY_NOTICES.md"
     ],

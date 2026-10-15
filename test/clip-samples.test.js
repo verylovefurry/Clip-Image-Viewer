@@ -8,6 +8,7 @@ const {
   decodeClipLayerForCanvas,
   decodeClipVector,
 } = require("../src/clip-layer-reader");
+const { renderCachedClipText } = require("../src/clip-text-renderer");
 const {
   extractClipData,
   loadLayerThumbnail,
@@ -87,6 +88,7 @@ async function run() {
   let totalTextObjects = 0;
   let totalLeaves = 0;
   let transformedObjects = 0;
+  let cachedTextObjects = 0;
   for (const file of files) {
     const clip = await extractClipData(path.join(SAMPLE_ROOT, file));
     clips.set(file, clip);
@@ -108,6 +110,23 @@ async function run() {
       }
       if (layer.type === "text") {
         assert(layer.textObjects.length > 0, `${file}:${layer.id} empty text object list`);
+        assert(["text", "story-information", "page-number"].includes(layer.kind), `${file}:${layer.id} text subtype`);
+        for (const object of layer.textObjects) {
+          assert(!object.extendedAttributes?.runs.length, `${file}:${layer.id} V01 records are not regular character runs`);
+        }
+        assert(layer.textRasterAvailable, `${file}:${layer.id} all text objects have native caches`);
+        for (const entry of clip.textSources[layer.id]) {
+          const glyph = decodeClipLayerForCanvas(clip.source, [entry], entry.width, entry.height);
+          assert(glyph, `${file}:${layer.id}:${entry.objectIndex} native text pixel decoding`);
+          cachedTextObjects += 1;
+        }
+      }
+      if (layer.type === "vector") {
+        assert(["vector", "vector-object"].includes(layer.kind), `${file}:${layer.id} vector subtype`);
+        assert(layer.vectorInfo, `${file}:${layer.id} vector properties`);
+      }
+      if (layer.storedRaster) {
+        assert(layer.storedRaster.width > 0 && layer.storedRaster.height > 0 && layer.storedRaster.levels > 0);
       }
       if (layer.type !== "group") {
         totalLeaves += 1;
@@ -140,6 +159,7 @@ async function run() {
   assert.equal(totalTextObjects, 415);
   assert.equal(totalLeaves, 482);
   assert.equal(transformedObjects, 19);
+  assert.equal(cachedTextObjects, 415, "all 415 CSP text object caches are decoded without fonts/CSP");
 
   const rasterCases = [
     ["page0006.clip", "9"],
@@ -171,11 +191,27 @@ async function run() {
   }
 
   const page = clips.get("page0006.clip");
+  const pageLayers = new Map(flattenLayers(page.layerDocument.layers).map((layer) => [layer.id, layer]));
+  assert.equal(pageLayers.get("10").kind, "frame-folder");
+  assert.equal(pageLayers.get("309").kind, "vector");
+  assert.equal(pageLayers.get("308").kind, "text");
+  assert.equal(pageLayers.get("5").kind, "story-information");
+  assert.equal(pageLayers.get("6").kind, "page-number");
+  assert.equal(pageLayers.get("9").kind, "raster");
   const item = {
     kind: "file",
     path: path.join(SAMPLE_ROOT, "page0006.clip"),
     name: "page0006.clip",
   };
+  const nativeText = await renderCachedClipText(page, pageLayers.get("308"), page.layerDocument.width, page.layerDocument.height);
+  const changedFonts = {
+    ...pageLayers.get("308"),
+    textObjects: pageLayers.get("308").textObjects.map((object) => ({
+      ...object, attributes: { ...object.attributes, font: "A font that is not installed", fontSize: 1, vertical: !object.attributes.vertical },
+    })),
+  };
+  assert(nativeText.equals(await renderCachedClipText({ ...page }, changedFonts, page.layerDocument.width, page.layerDocument.height)),
+    "cached CSP text pixels do not depend on font availability or reconstructed text styling");
   const textOnly = await renderLayeredImage(
     item,
     isolatedVisibility(page.layerDocument.layers, "308"),
@@ -231,9 +267,10 @@ async function run() {
 
   const originalVisibility = documentVisibility(page.layerDocument.layers);
   const hiddenTextLayer = { ...originalVisibility, 308: false };
+  const toggledText = await renderLayeredImage(item, hiddenTextLayer);
   const [originalPreview, originalPreservingToggle] = await Promise.all([
     sharp(page.preview).ensureAlpha().raw().toBuffer({ resolveWithObject: true }),
-    sharp(imageBuffer(await renderLayeredImage(item, hiddenTextLayer)))
+    sharp(imageBuffer(toggledText))
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true }),
@@ -253,6 +290,17 @@ async function run() {
     "visibility change preserves unrelated original pixels",
   );
 
+  assert.strictEqual(await renderLayeredImage(item, hiddenTextLayer), toggledText, "warm text toggles reuse the rendered result");
+  const hiddenFolder = { ...originalVisibility, 10: false };
+  const folderStarted = performance.now();
+  const toggledFolder = await renderLayeredImage(item, hiddenFolder);
+  const coldFolderMs = performance.now() - folderStarted;
+  const cachedStarted = performance.now();
+  for (let index = 0; index < 20; index += 1) {
+    assert.strictEqual(await renderLayeredImage(item, hiddenFolder), toggledFolder, "warm folder toggles reuse the rendered result");
+    assert.strictEqual(await renderLayeredImage(item, hiddenTextLayer), toggledText, "metadata display does not invalidate layer caches");
+  }
+  console.log(`CLIP folder render: ${Math.round(coldFolderMs)}ms; warm cached render: ${((performance.now() - cachedStarted) / 40).toFixed(2)}ms/call`);
   console.log("CLIP sample tests passed");
 }
 

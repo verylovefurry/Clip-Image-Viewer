@@ -100,6 +100,36 @@ function attachElectronSmoke({
         }
       }
 
+      if (process.env.CLIPVIEW_SMOKE_DECODER_RACE === "1") {
+        const decoderTest = await mainWindow.webContents.executeJavaScript(`(async () => {
+          const originalDecode = HTMLImageElement.prototype.decode;
+          HTMLImageElement.prototype.decode = function () {
+            if (this.isConnected && this.id === "viewerImage") {
+              return Promise.reject(new DOMException("The source image cannot be decoded.", "EncodingError"));
+            }
+            return originalDecode.call(this);
+          };
+          try {
+            const next = (state.index + 1) % state.items.length;
+            await selectItem(next, { immediate: true });
+            const visible = document.getElementById("viewerImage");
+            if (imageLayer.classList.contains("hidden") || !visible.naturalWidth ||
+                visible.alt !== currentItem().name) {
+              throw new Error("Transient display decoding failure left the viewer empty");
+            }
+            await selectItem((next + 1) % state.items.length, { immediate: true });
+            await selectItem(next, { immediate: true });
+            if (!image.naturalWidth || image.alt !== currentItem().name) {
+              throw new Error("Cached image failed after a return navigation");
+            }
+            return { index: state.index, name: currentItem().name };
+          } finally {
+            HTMLImageElement.prototype.decode = originalDecode;
+          }
+        })()`);
+        console.log("Display decoder regression passed: " + JSON.stringify(decoderTest));
+      }
+
       if (process.env.CLIPVIEW_SMOKE_RAPID_NAVIGATION === "1") {
         const navigation = await mainWindow.webContents.executeJavaScript(`(async () => {
           if (state.items.length < 3) throw new Error("Rapid navigation needs at least three items");
@@ -140,6 +170,10 @@ function attachElectronSmoke({
               if (state.layerPreparationStarted) throw new Error("Hidden layer panel started a full render");
             }
             if (imageCache.size > 3) throw new Error("Navigation retained obsolete image cache entries");
+            const bytes = [...imageCache.values()].reduce((sum, entry) => sum + entry.bytes, 0);
+            if (bytes > MAX_IMAGE_CACHE_BYTES && imageCache.size > 1) {
+              throw new Error("Decoded image cache exceeded its memory budget");
+            }
             if (errors.length) throw new Error(errors.join("; "));
             return { moves: 120, index: state.index, name: currentItem().name, cacheEntries: imageCache.size };
           } finally {
@@ -174,6 +208,115 @@ function attachElectronSmoke({
           return { initialCount, items: state.items.length };
         })()`);
         console.log(`Thumbnail window smoke passed: ${JSON.stringify(thumbnails)}`);
+      }
+
+      if (process.env.CLIPVIEW_SMOKE_CORRUPT_IMAGE) {
+        const corruptPath = process.env.CLIPVIEW_SMOKE_CORRUPT_IMAGE;
+        const originalPath = await mainWindow.webContents.executeJavaScript("currentItem().path");
+        await mainWindow.webContents.executeJavaScript("openPath(" + JSON.stringify(corruptPath) + ")");
+        const failed = await mainWindow.webContents.executeJavaScript(`(() => ({
+          errorVisible: !errorState.classList.contains("hidden"),
+          emptyHidden: emptyState.classList.contains("hidden"),
+          retryEnabled: !document.getElementById("retryFileBtn").disabled,
+          busy: stage.getAttribute("aria-busy"),
+        }))()`);
+        if (!failed.errorVisible || !failed.emptyHidden || !failed.retryEnabled || failed.busy !== "false") {
+          throw new Error("Unreadable file did not show a recoverable error: " + JSON.stringify(failed));
+        }
+        fs.copyFileSync(require("path").join(require("path").dirname(corruptPath), "valid.png"), corruptPath);
+        await mainWindow.webContents.executeJavaScript(`(async () => {
+          releaseImageEntry(imageKey(state.index));
+          await loadCurrent();
+          if (!errorState.classList.contains("hidden") || imageLayer.classList.contains("hidden")) {
+            throw new Error("Retry did not recover the repaired image");
+          }
+          const controller = new AbortController();
+          const pending = decodeImage(state.imageDataUrl, controller.signal);
+          controller.abort();
+          try { await pending; throw new Error("Cancelled image unexpectedly loaded"); }
+          catch (error) { if (error.code !== "ERR_IMAGE_REQUEST_CANCELLED") throw error; }
+        })()`);
+        await mainWindow.webContents.executeJavaScript("openPath(" + JSON.stringify(originalPath) + ")");
+        console.log("Invalid image recovery and decode cancellation passed");
+      }
+
+      if (process.env.CLIPVIEW_SMOKE_UI_QA_DIR) {
+        const directory = process.env.CLIPVIEW_SMOKE_UI_QA_DIR;
+        fs.mkdirSync(directory, { recursive: true });
+        const originalBounds = mainWindow.getBounds();
+        const capture = async (name) => {
+          await wait(120);
+          fs.writeFileSync(require("path").join(directory, name), (await mainWindow.webContents.capturePage()).toPNG());
+        };
+        for (const [width, height] of [[1200, 820], [720, 900], [480, 640], [320, 400]]) {
+          mainWindow.setContentSize(width, height);
+          await wait(120);
+          const layout = await mainWindow.webContents.executeJavaScript(`(() => {
+            const outside = [];
+            for (const selector of [".topbar", ".bottombar"]) {
+              const parent = document.querySelector(selector).getBoundingClientRect();
+              for (const child of document.querySelector(selector).querySelectorAll("button, summary, select")) {
+                if (child.closest(".tools-menu")) continue;
+                const rect = child.getBoundingClientRect();
+                if (!rect.width || !rect.height) continue;
+                if (rect.height > 34) outside.push("wrapped:" + (child.id || child.tagName));
+                if (rect.left < parent.left - 1 || rect.right > parent.right + 1 ||
+                    rect.top < parent.top - 1 || rect.bottom > parent.bottom + 1) outside.push(child.id || child.tagName);
+              }
+            }
+            return { width: window.innerWidth, height: window.innerHeight, outside };
+          })()`);
+          if (layout.outside.length) throw new Error("Toolbar overflow: " + JSON.stringify(layout));
+          if (process.env.CLIPVIEW_SMOKE_EXPECT_VIDEO) {
+            const videoLayout = await mainWindow.webContents.executeJavaScript(`(() => {
+              const originalMode = state.videoPlaybackMode;
+              showVideoControls("full", 0, { forceFull: true });
+              const parent = videoControls.getBoundingClientRect();
+              const outside = [];
+              for (const mode of Object.keys(VIDEO_PLAYBACK_MODES)) {
+                setVideoPlaybackMode(mode);
+                for (const control of videoControls.querySelectorAll("button, select, input")) {
+                  const rect = control.getBoundingClientRect();
+                  if (rect.width > 0 && (rect.left < parent.left - 1 || rect.right > parent.right + 1 ||
+                      rect.top < parent.top - 1 || rect.bottom > parent.bottom + 1)) outside.push(mode + ":" + control.id);
+                }
+              }
+              setVideoPlaybackMode(originalMode);
+              showVideoControls("full", 0, { forceFull: true });
+              return outside;
+            })()`);
+            if (videoLayout.length) throw new Error("Video toolbar overflow: " + videoLayout.join(", "));
+          }
+          await capture(`viewer-${width}.png`);
+          await mainWindow.webContents.executeJavaScript("openSettings()");
+          for (const page of ["view", "files", "update"]) {
+            await mainWindow.webContents.executeJavaScript("selectSettingsPage(" + JSON.stringify(page) + ")");
+            const dialog = await mainWindow.webContents.executeJavaScript(`(() => {
+              const dialog = document.getElementById("settingsDialog").getBoundingClientRect();
+              const footer = document.querySelector(".dialog-footer").getBoundingClientRect();
+              return dialog.left >= 0 && dialog.right <= window.innerWidth && dialog.top >= 0 &&
+                dialog.bottom <= window.innerHeight && footer.bottom <= dialog.bottom;
+            })()`);
+            if (!dialog) throw new Error("Settings dialog exceeded the window");
+            await capture(`settings-${page}-${width}.png`);
+          }
+          await mainWindow.webContents.executeJavaScript("document.getElementById('settingsDialog').close()");
+        }
+        mainWindow.setContentSize(1200, 820);
+        await mainWindow.webContents.executeJavaScript(`(async () => {
+          const layered = state.items.findIndex((item) => item.name.endsWith(".psd") || item.name.endsWith(".clip"));
+          if (layered >= 0) await selectItem(layered, { immediate: true });
+          if (state.layerDocument) toggleLayers(true);
+        })()`);
+        await wait(700);
+        await capture("layers.png");
+        await mainWindow.webContents.executeJavaScript("toggleLayers(false); toggleInfo(true)");
+        await capture("information.png");
+        await mainWindow.webContents.executeJavaScript("toggleInfo(false)");
+        mainWindow.setBounds(originalBounds);
+        await wait(150);
+        title = await mainWindow.webContents.executeJavaScript("document.title");
+        console.log("UI layout passed at 320, 480, 720 and 1200 pixels");
       }
 
       if (process.env.CLIPVIEW_SMOKE_SHELL_THUMBNAIL) {
@@ -334,6 +477,34 @@ function attachElectronSmoke({
             throw new Error(`Layer folder toggle failed: ${JSON.stringify(folderToggle)}`);
           }
         }
+        const layerMetadata = await mainWindow.webContents.executeJavaScript(`(() => {
+          if (state.layerDocument?.format !== "CLIP") return null;
+          const rows = [...document.querySelectorAll(".layer-row")];
+          const all = [...state.layerIndex.values()];
+          if (!rows.every((row) => row.querySelector(".layer-kind")?.textContent === layerById(row.dataset.layerId)?.typeLabel)) {
+            throw new Error("Layer kinds are missing or inconsistent in the list");
+          }
+          const results = [];
+          for (const type of ["raster", "vector", "text"]) {
+            const layer = all.find((entry) => entry.type === type);
+            if (!layer) continue;
+            const before = performance.now();
+            selectLayer(layer.id);
+            const details = document.getElementById("layerDetailList").textContent;
+            if (!details.includes(layer.typeLabel)) throw new Error("Selected layer kind is missing");
+            if (type === "text") {
+              if (document.querySelectorAll(".layer-text-object").length !== layer.textObjects.length) throw new Error("Text objects are missing");
+              if (!document.getElementById("layerTextObjects").textContent.includes("쓰기 방향")) throw new Error("Text properties are missing");
+            }
+            const panel = document.getElementById("layerPanel").getBoundingClientRect();
+            const detail = document.getElementById("layerDetails").getBoundingClientRect();
+            if (detail.bottom > panel.bottom + 1 || detail.height < 1) throw new Error("Layer details are not visible in the panel");
+            results.push({ type, selectionMs: Math.round(performance.now() - before) });
+          }
+          if (!rows.every((row) => row.isConnected)) throw new Error("Layer selection rebuilt the tree");
+          return results;
+        })()`);
+        if (layerMetadata) console.log(`Layer metadata smoke: ${JSON.stringify(layerMetadata)}`);
         if (layers.thumbnailCount) {
           let thumbnailsReady = false;
           for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -376,6 +547,69 @@ function attachElectronSmoke({
           if (!changed) throw new Error("Layer visibility did not update the image");
           console.log(`Layer toggle smoke duration: ${Date.now() - toggleStartedAt}ms`);
         }
+        if (process.env.CLIPVIEW_SMOKE_LAYER_DETAILS === "1") {
+          const performance = await mainWindow.webContents.executeJavaScript(`(async () => {
+            const all = [...state.layerIndex.values()];
+            const rows = [...document.querySelectorAll(".layer-row")];
+            const objects = [...document.querySelectorAll(".layer-text-object")];
+            const results = [];
+            for (const type of ["raster", "group"]) {
+              const layer = all.find((entry) => entry.type === type && entry.toggleAvailable && layerIsVisible(entry.id));
+              if (!layer) continue;
+              const button = state.layerRows.get(layer.id)?.querySelector(".layer-visibility");
+              if (!button) continue;
+              button.focus();
+              const childVisibility = Object.fromEntries(flattenLayers(layer.children).map((child) => [child.id, state.layerVisibility[child.id]]));
+              const durations = [];
+              const uiDurations = [];
+              for (let index = 0; index < 4; index += 1) {
+                const expected = !state.layerVisibility[layer.id];
+                const start = performance.now();
+                const pending = toggleLayerVisibility(layer.id);
+                uiDurations.push(performance.now() - start);
+                await pending;
+                durations.push(Math.round(performance.now() - start));
+                if (state.renderedLayerVisibility[layer.id] !== expected) throw new Error("Layer render failed");
+                if (document.activeElement !== button || !button.isConnected) throw new Error("Layer toggle lost its button/focus");
+                if (!Object.entries(childVisibility).every(([id, visible]) => state.layerVisibility[id] === visible)) throw new Error("Folder toggle changed child switches");
+                if (type === "group" && !expected) {
+                  for (const child of flattenLayers(layer.children)) {
+                    if (state.layerRows.get(child.id)?.dataset.effectiveVisible !== "false") throw new Error("Inherited visibility is not shown");
+                  }
+                }
+              }
+              results.push({ type, renderMs: durations, maxUiMs: Math.round(Math.max(...uiDurations)) });
+            }
+            if (!rows.every((row) => row.isConnected) || !objects.every((object) => object.isConnected)) throw new Error("Visibility changes rebuilt layer information");
+            return results;
+          })()`);
+          console.log(`Layer visibility performance: ${JSON.stringify(performance)}`);
+        }
+        if (process.env.CLIPVIEW_SMOKE_LAYER_QA_DIR) {
+          const directory = process.env.CLIPVIEW_SMOKE_LAYER_QA_DIR;
+          fs.mkdirSync(directory, { recursive: true });
+          const originalBounds = mainWindow.getBounds();
+          for (const [width, height] of [[1200, 820], [720, 900], [480, 640], [320, 400]]) {
+            mainWindow.setContentSize(width, height);
+            await wait(150);
+            const layerLayout = await mainWindow.webContents.executeJavaScript(`(() => {
+              const text = [...state.layerIndex.values()].find((entry) => entry.kind === "text" && entry.textObjects.length > 1);
+              if (text) selectLayer(text.id);
+              const panel = document.getElementById("layerPanel").getBoundingClientRect();
+              const tree = document.getElementById("layerTree");
+              const detail = document.getElementById("layerDetails").getBoundingClientRect();
+              return { outside: panel.left < 0 || panel.right > window.innerWidth || detail.bottom > panel.bottom + 1,
+                treeOverflow: tree.scrollWidth > tree.clientWidth + 1, treeHeight: tree.clientHeight, detailsHeight: detail.height };
+            })()`);
+            if (layerLayout.outside || layerLayout.treeOverflow || layerLayout.treeHeight < 40 || layerLayout.detailsHeight < 30) {
+              throw new Error("Layer panel layout failed: " + JSON.stringify(layerLayout));
+            }
+            await wait(100);
+            fs.writeFileSync(require("path").join(directory, `layer-details-${width}.png`), (await mainWindow.webContents.capturePage()).toPNG());
+          }
+          mainWindow.setBounds(originalBounds);
+          await wait(150);
+        }
       }
 
       await mainWindow.webContents.executeJavaScript(
@@ -383,10 +617,11 @@ function attachElectronSmoke({
       );
       const geometry = await mainWindow.webContents.executeJavaScript(`(() => {
         const stage = document.getElementById("stage").getBoundingClientRect();
-        const image = document.getElementById("viewerImage");
+        const image = document.getElementById("imageLayer").classList.contains("video-active")
+          ? document.getElementById("viewerVideo") : document.getElementById("viewerImage");
         const topbar = document.querySelector(".topbar").getBoundingClientRect();
         const bottombar = document.querySelector(".bottombar").getBoundingClientRect();
-        if (!image.naturalWidth) return null;
+        if (!(image.naturalWidth || image.videoWidth) || image.classList.contains("hidden")) return null;
         const imageRect = image.getBoundingClientRect();
         return {
           deltaX: imageRect.left + imageRect.width / 2 - (stage.left + stage.width / 2),

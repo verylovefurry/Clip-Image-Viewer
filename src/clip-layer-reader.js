@@ -14,7 +14,7 @@ const MAX_EXTERNAL_CHUNK_BYTES = 256 * 1024 * 1024;
 const MAX_DECODE_PIXELS = 64 * 1024 * 1024;
 const MAX_SOURCE_PIXELS = 512 * 1024 * 1024;
 const MAX_VECTOR_POINTS = 200000;
-const MIN_VECTOR_HEADER_SIZE = 92;
+const MIN_VECTOR_HEADER_SIZE = 88;
 const MIN_VECTOR_POINT_SIZE = 88;
 
 function utf16be(value) {
@@ -182,6 +182,55 @@ function extractClipThumbnailSources(db) {
 
 function extractClipMaskSources(db) {
   return extractClipMipmapSources(db, "LayerLayerMaskMipmap");
+}
+
+function extractClipTextSources(db, layers) {
+  try {
+    const offscreens = new Map(queryRows(db, "SELECT MainId, LayerId, Attribute, BlockData FROM Offscreen")
+      .map((row) => [Number(row.MainId), row]));
+    const externalOffsets = new Map(queryRows(db, "SELECT ExternalID, Offset FROM ExternalChunk")
+      .map((row) => [blobKey(row.ExternalID), Number(row.Offset)]));
+    const sources = {};
+    const visit = (nodes) => {
+      for (const layer of nodes || []) {
+        const entries = [];
+        for (const object of layer.textObjects || []) {
+          const cacheId = object.attributes?.renderCacheId || object.extendedAttributes?.renderCacheId;
+          const offscreen = offscreens.get(cacheId);
+          const bounds = object.attributes?.bounds || object.extendedAttributes?.bounds;
+          if (!offscreen?.Attribute || String(Number(offscreen.LayerId)) !== layer.id ||
+              !Array.isArray(bounds) || bounds.length !== 4) continue;
+          const externalId = blobKey(offscreen.BlockData);
+          const offset = externalOffsets.get(externalId);
+          if (!externalId || !Number.isSafeInteger(offset) || offset < 0) continue;
+          try {
+            const attribute = Buffer.from(offscreen.Attribute);
+            const geometry = parseOffscreenAttributes(attribute);
+            entries.push({
+              objectIndex: object.index,
+              offscreenId: cacheId,
+              attribute,
+              externalId,
+              offset,
+              scale: 100,
+              width: geometry.width,
+              height: geometry.height,
+              left: bounds[0],
+              top: bounds[1],
+            });
+          } catch {
+            // A corrupt object cache must not be borrowed from another layer.
+          }
+        }
+        if (entries.length) sources[layer.id] = entries;
+        visit(layer.children);
+      }
+    };
+    visit(layers);
+    return sources;
+  } catch {
+    return {};
+  }
 }
 
 function extractClipVectorSources(db) {
@@ -489,6 +538,108 @@ function clipLayerPixelFormat(packing) {
   return "";
 }
 
+function decodeClipLayerLinear(blocks, attributes, level, targetWidth, targetHeight, options) {
+  const { width, height, gridWidth, packing, defaultFill } = attributes;
+  const format = clipLayerPixelFormat(packing);
+  const lengths = { rgba: TILE_PIXELS * 5, "gray-alpha": TILE_PIXELS * 2,
+    "bit-gray-alpha": TILE_PIXELS / 4, alpha: TILE_PIXELS };
+  const bitAlpha = format === "alpha" && packing[8] === 32;
+  const expected = bitAlpha ? TILE_PIXELS / 8 : lengths[format];
+  const canvasWidth = Math.max(1, Number(options.canvasWidth) || width);
+  const canvasHeight = Math.max(1, Number(options.canvasHeight) || height);
+  const levelScale = Number(level.scale) > 0 ? Number(level.scale) / 100 : 1;
+  const candidate = 2 ** Math.max(0, Math.round(Math.log2(canvasHeight / targetHeight)));
+  const aligned = candidate > 1 && Math.abs(canvasWidth / candidate - targetWidth) <= 1 &&
+    Math.abs(canvasHeight / candidate - targetHeight) <= 1;
+  const stepX = (aligned ? candidate : canvasWidth / targetWidth) * levelScale;
+  const stepY = (aligned ? candidate : canvasHeight / targetHeight) * levelScale;
+  const offsetX = (Number(options.offsetX) || 0) * levelScale;
+  const offsetY = (Number(options.offsetY) || 0) * levelScale;
+  const color = Array.isArray(options.color) ? options.color : [0, 0, 0];
+  const output = Buffer.alloc(targetWidth * targetHeight * 4);
+  const tileRows = new Map();
+  let decodedTileCount = 0;
+  const loadRow = (rowIndex) => {
+    if (rowIndex < 0 || rowIndex * TILE_SIZE >= height) return null;
+    let row = tileRows.get(rowIndex);
+    if (!row) {
+      row = Array.from({ length: gridWidth }, (_, column) => {
+        const compressed = blocks[rowIndex * gridWidth + column];
+        if (!compressed) return null;
+        const decoded = zlib.inflateSync(compressed, { maxOutputLength: expected });
+        if (decoded.length !== expected) throw new Error("CLIP 레이어 타일의 픽셀 길이가 일치하지 않습니다.");
+        decodedTileCount += 1;
+        return decoded;
+      });
+      tileRows.set(rowIndex, row);
+      while (tileRows.size > 2) tileRows.delete(tileRows.keys().next().value);
+    }
+    return row;
+  };
+  const sample = (x, row, tileOffset, weight, accumulated) => {
+    if (!weight || !row || x < 0 || x >= width) return;
+    const data = row[x >> 8];
+    const index = tileOffset + (x & 255);
+    let red = format === "alpha" ? color[0] : 255;
+    let green = format === "alpha" ? color[1] : 255;
+    let blue = format === "alpha" ? color[2] : 255;
+    let alpha = defaultFill ? 255 : 0;
+    if (data) {
+      if (format === "rgba") {
+        const rgbx = TILE_PIXELS + index * 4;
+        red = data[rgbx + 2]; green = data[rgbx + 1]; blue = data[rgbx]; alpha = data[index];
+      } else if (format === "gray-alpha") {
+        red = green = blue = data[TILE_PIXELS + index]; alpha = data[index];
+      } else if (format === "bit-gray-alpha") {
+        const bit = 7 - (index & 7);
+        alpha = ((data[index >> 3] >> bit) & 1) * 255;
+        red = green = blue = ((data[TILE_PIXELS / 8 + (index >> 3)] >> bit) & 1) * 255;
+      } else alpha = bitAlpha ? ((data[index >> 3] >> (7 - (index & 7))) & 1) * 255 : data[index];
+    }
+    const coverage = weight * alpha;
+    accumulated[0] += red * coverage;
+    accumulated[1] += green * coverage;
+    accumulated[2] += blue * coverage;
+    accumulated[3] += coverage;
+  };
+  // CSP's preview grid uses power-of-two pixel-centre sampling rather than
+  // stretching an odd-sized canvas to its truncated preview dimensions.
+  const sourceXs = new Int32Array(targetWidth);
+  const weights = new Float64Array(targetWidth);
+  for (let x = 0; x < targetWidth; x += 1) {
+    const source = (x + 0.5) * stepX - 0.5 - offsetX;
+    sourceXs[x] = Math.floor(source);
+    weights[x] = source - sourceXs[x];
+  }
+  const accumulated = new Float64Array(4);
+  for (let y = 0; y < targetHeight; y += 1) {
+    const sourceY = (y + 0.5) * stepY - 0.5 - offsetY;
+    const y0 = Math.floor(sourceY);
+    const dy = sourceY - y0;
+    const upper = y0 >= 0 && y0 < height ? loadRow(Math.floor(y0 / TILE_SIZE)) : null;
+    const lower = y0 + 1 >= 0 && y0 + 1 < height ? loadRow(Math.floor((y0 + 1) / TILE_SIZE)) : null;
+    const upperOffset = (y0 & 255) * TILE_SIZE;
+    const lowerOffset = ((y0 + 1) & 255) * TILE_SIZE;
+    for (let x = 0; x < targetWidth; x += 1) {
+      const x0 = sourceXs[x];
+      const dx = weights[x];
+      accumulated.fill(0);
+      sample(x0, upper, upperOffset, (1 - dx) * (1 - dy), accumulated);
+      sample(x0 + 1, upper, upperOffset, dx * (1 - dy), accumulated);
+      sample(x0, lower, lowerOffset, (1 - dx) * dy, accumulated);
+      sample(x0 + 1, lower, lowerOffset, dx * dy, accumulated);
+      const index = (y * targetWidth + x) * 4;
+      if (accumulated[3]) {
+        for (let channel = 0; channel < 3; channel += 1) {
+          output[index + channel] = Math.round(accumulated[channel] / accumulated[3]);
+        }
+        output[index + 3] = Math.round(accumulated[3]);
+      }
+    }
+  }
+  return decodedTileCount || defaultFill ? { data: output, width: targetWidth, height: targetHeight } : null;
+}
+
 function decodeClipLayerLevelScaled(
   source,
   level,
@@ -521,6 +672,13 @@ function decodeClipLayerLevelScaled(
   );
   if (blocks.length !== gridWidth * gridHeight) {
     throw new Error("CLIP 레이어 타일 수가 일치하지 않습니다.");
+  }
+  const rowBytes = gridWidth * ({ rgba: TILE_PIXELS * 5, "gray-alpha": TILE_PIXELS * 2,
+    "bit-gray-alpha": TILE_PIXELS / 4, alpha: TILE_PIXELS }[format]);
+  // Row buffering must stay bounded even for adversarial, extremely wide
+  // sparse surfaces. The tile-at-a-time decoder below remains the fallback.
+  if (options.sampling === "linear" && rowBytes * 2 <= 32 * 1024 * 1024) {
+    return decodeClipLayerLinear(blocks, attributes, level, outputWidth, outputHeight, options);
   }
 
   const canvasWidth = Math.max(1, Number(options.canvasWidth) || width);
@@ -560,16 +718,20 @@ function decodeClipLayerLevelScaled(
       let pixels;
       try {
         pixels = zlib.inflateSync(compressed, { maxOutputLength: TILE_PIXELS * 5 });
-      } catch {
+      } catch (error) {
+        if (options.strictTiles) throw new Error("CLIP 레이어 타일을 해제하지 못했습니다.", { cause: error });
         continue;
       }
       const expectedLength = {
         rgba: TILE_PIXELS * 5,
         "gray-alpha": TILE_PIXELS * 2,
         "bit-gray-alpha": TILE_PIXELS / 4,
-        alpha: TILE_PIXELS,
+        alpha: packing[8] === 32 ? TILE_PIXELS / 8 : TILE_PIXELS,
       }[format];
-      if (pixels.length !== expectedLength) continue;
+      if (pixels.length !== expectedLength) {
+        if (options.strictTiles) throw new Error("CLIP 레이어 타일의 픽셀 길이가 일치하지 않습니다.");
+        continue;
+      }
       decodedTileCount += 1;
       const sourceLeft = tileX * TILE_SIZE;
       const sourceTop = tileY * TILE_SIZE;
@@ -623,7 +785,9 @@ function decodeClipLayerLevelScaled(
             blue = red;
           } else {
             [red, green, blue] = color;
-            alpha = pixels[tilePixel];
+            alpha = packing[8] === 32
+              ? ((pixels[tilePixel >> 3] >> (7 - (tilePixel & 7))) & 1) * 255
+              : pixels[tilePixel];
           }
           output[outputPixel] = red;
           output[outputPixel + 1] = green;
@@ -709,12 +873,14 @@ function decodeClipMaskForCanvas(
       const compressed = blocks[tileY * gridWidth + tileX];
       if (!compressed) continue;
       let pixels;
+      const bitMask = packing[8] === 32;
+      const planeSize = bitMask ? TILE_PIXELS / 8 : TILE_PIXELS;
       try {
-        pixels = zlib.inflateSync(compressed, { maxOutputLength: TILE_PIXELS });
+        pixels = zlib.inflateSync(compressed, { maxOutputLength: planeSize });
       } catch {
         continue;
       }
-      if (pixels.length !== TILE_PIXELS) continue;
+      if (pixels.length !== planeSize) continue;
       const sourceLeft = tileX * TILE_SIZE;
       const sourceTop = tileY * TILE_SIZE;
       const sourceRight = Math.min(width, sourceLeft + TILE_SIZE);
@@ -739,9 +905,10 @@ function decodeClipMaskForCanvas(
             sourceRight - 1,
             Math.floor((x + 0.5) / scaleX - offsetX),
           ));
-          output[y * outputWidth + x] = pixels[
-            (sourceY - sourceTop) * TILE_SIZE + sourceX - sourceLeft
-          ];
+          const tilePixel = (sourceY - sourceTop) * TILE_SIZE + sourceX - sourceLeft;
+          output[y * outputWidth + x] = bitMask
+            ? ((pixels[tilePixel >> 3] >> (7 - (tilePixel & 7))) & 1) * 255
+            : pixels[tilePixel];
         }
       }
     }
@@ -790,8 +957,15 @@ function vectorStrokeInfo(data, offset, brushStyles) {
   ) {
     return null;
   }
-  const styleId = String(data.readUInt32BE(offset + styleOffset));
-  const baseSize = data.readDoubleBE(offset + styleOffset + 4);
+  let styleId = String(data.readUInt32BE(offset + styleOffset));
+  // Extended stroke headers place the radius/seed at the end, with extra
+  // style descriptor words before them (frame borders use this layout).
+  const radiusOffset = headerSize - 12;
+  for (let position = styleOffset; position + 4 <= radiusOffset; position += 4) {
+    const candidate = String(data.readUInt32BE(offset + position));
+    if (brushStyles?.[candidate]) { styleId = candidate; break; }
+  }
+  const baseSize = data.readDoubleBE(offset + radiusOffset) * 2;
   if (!Number.isFinite(baseSize) || baseSize <= 0 || baseSize > 10000) return null;
   return {
     baseSize,
@@ -800,6 +974,11 @@ function vectorStrokeInfo(data, offset, brushStyles) {
     pointStride,
     styleId,
     style: brushStyles?.[styleId] || null,
+    color: [40, 44, 48].map((delta) => {
+      const channel = data.readUInt32BE(offset + delta);
+      return channel <= 0xffff ? channel >>> 8 : channel >>> 24;
+    }),
+    opacity: data.readDoubleBE(offset + 64),
   };
 }
 
@@ -807,21 +986,23 @@ function vectorRecord(data, offset, maximumX, maximumY, strokeInfo = null) {
   if (offset < 0 || offset + MIN_VECTOR_POINT_SIZE > data.length) return null;
   const x = data.readDoubleBE(offset);
   const y = data.readDoubleBE(offset + 8);
-  const left = data.readUInt32BE(offset + 16);
-  const top = data.readUInt32BE(offset + 20);
-  const right = data.readUInt32BE(offset + 24);
-  const bottom = data.readUInt32BE(offset + 28);
+  const left = data.readInt32BE(offset + 16);
+  const top = data.readInt32BE(offset + 20);
+  const right = data.readInt32BE(offset + 24);
+  const bottom = data.readInt32BE(offset + 28);
+  const flags = data.readUInt32BE(offset + 32);
   const pressure = data.readFloatBE(offset + 36);
-  const tilt = data.readFloatBE(offset + 40);
-  const velocity = data.readFloatBE(offset + 44);
+  const velocity = data.readFloatBE(offset + 40);
+  const smooth = data.readFloatBE(offset + 44);
+  const tilt = data.readFloatBE(offset + 52);
+  const storedSize = data.readFloatBE(offset + 56);
   const envelopeWidth = Math.max(right - left, bottom - top);
   if (
     left > right ||
     top > bottom ||
     envelopeWidth < 1 ||
-    right > maximumX ||
-    bottom > maximumY ||
-    envelopeWidth > Math.max(512, Math.min(maximumX, maximumY) / 2) ||
+    left < -maximumX || top < -maximumY || right > maximumX || bottom > maximumY ||
+    envelopeWidth > Math.max(maximumX, maximumY) ||
     !Number.isFinite(x) ||
     !Number.isFinite(y) ||
     !Number.isFinite(pressure) ||
@@ -843,7 +1024,7 @@ function vectorRecord(data, offset, maximumX, maximumY, strokeInfo = null) {
   if (strokeInfo) {
     const style = strokeInfo.style;
     let pressureFactor = 1;
-    if (style?.pressureEnabled) {
+    if (style?.pressureEnabled && !(flags & 0x1000)) {
       const pressureCurve = evaluateBrushGraph(style.pressureGraph, pressure);
       const pressureMinimum = Math.max(0, Math.min(1, style.pressureMinimum || 0));
       pressureFactor = pressureMinimum + (1 - pressureMinimum) * pressureCurve;
@@ -854,7 +1035,8 @@ function vectorRecord(data, offset, maximumX, maximumY, strokeInfo = null) {
       const velocityMinimum = Math.max(0, Math.min(1, style.velocityMinimum || 0));
       velocityFactor = velocityMinimum + (1 - velocityMinimum) * velocityCurve;
     }
-    width = Math.max(0.01, strokeInfo.baseSize * pressureFactor * velocityFactor);
+    const sizeFactor = Number.isFinite(storedSize) && storedSize > 0 && storedSize <= 10000 ? storedSize : 1;
+    width = Math.max(0.01, strokeInfo.baseSize * pressureFactor * velocityFactor * sizeFactor);
     thickness = style?.thickness || 1;
     rotation = style?.rotation || 0;
   }
@@ -864,9 +1046,15 @@ function vectorRecord(data, offset, maximumX, maximumY, strokeInfo = null) {
     width,
     pressure,
     velocity,
+    smooth: Number.isFinite(smooth) ? smooth : 0,
+    flags,
+    storedSize: Number.isFinite(storedSize) ? storedSize : 1,
     tilt: Number.isFinite(tilt) ? tilt : 0,
     thickness,
     rotation,
+    color: strokeInfo?.color || null,
+    opacity: Number.isFinite(strokeInfo?.opacity) ? Math.max(0, Math.min(1, strokeInfo.opacity)) : 1,
+    brushId: strokeInfo?.styleId || "",
   };
 }
 
@@ -909,15 +1097,16 @@ function decodeClipVector(source, entries, canvasWidth, canvasHeight, brushStyle
     if (pointCount >= MAX_VECTOR_POINTS) break;
   }
   if (!segments.length) return null;
-  const points = segments.flat();
+  const bounds = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+  for (const segment of segments) for (const point of segment) {
+    bounds.left = Math.min(bounds.left, point.x - point.width / 2);
+    bounds.top = Math.min(bounds.top, point.y - point.width / 2);
+    bounds.right = Math.max(bounds.right, point.x + point.width / 2);
+    bounds.bottom = Math.max(bounds.bottom, point.y + point.width / 2);
+  }
   return {
     segments,
-    bounds: {
-      left: Math.min(...points.map((point) => point.x - point.width / 2)),
-      top: Math.min(...points.map((point) => point.y - point.width / 2)),
-      right: Math.max(...points.map((point) => point.x + point.width / 2)),
-      bottom: Math.max(...points.map((point) => point.y + point.width / 2)),
-    },
+    bounds,
   };
 }
 
@@ -932,6 +1121,7 @@ module.exports = {
   extractClipObjectSources,
   extractClipRasterSources,
   extractClipThumbnailSources,
+  extractClipTextSources,
   extractClipVectorSources,
   parseChunkBlocks,
   parseOffscreenAttributes,

@@ -15,16 +15,18 @@ async function run() {
     fs.mkdirSync(media);
     for (let index = 0; index < 64; index += 1) {
       const ext = ["png", "jpeg", "webp", "psd"][index % 4];
+      const width = index < 4 ? 3840 + index : 256 + index;
+      const height = index < 4 ? 2160 + index : 192 + index;
       const output = path.join(media, `page${String(index).padStart(3, "0")}.${ext}`);
       const pixels = sharp({
         create: {
-          width: 256 + index, height: 192 + index, channels: 4,
+          width, height, channels: 4,
           background: { r: index * 3, g: 180, b: 255 - index * 3, alpha: 1 },
         },
       });
       if (ext === "psd") {
         const data = await pixels.raw().toBuffer();
-        const imageData = { width: 256 + index, height: 192 + index, data };
+        const imageData = { width, height, data };
         fs.writeFileSync(output, writePsdBuffer({
           width: imageData.width, height: imageData.height, imageData,
           children: [{ name: "Sample layer", left: 0, top: 0, imageData }],
@@ -33,16 +35,26 @@ async function run() {
         await pixels.toFormat(ext).toFile(output);
       }
     }
+    const recovery = path.join(directory, "recovery");
+    fs.mkdirSync(recovery);
+    const corruptImage = path.join(recovery, "broken.png");
+    fs.writeFileSync(corruptImage, "not an image");
+    fs.copyFileSync(path.join(media, "page000.png"), path.join(recovery, "valid.png"));
     const env = {
       ...process.env,
       CLIPVIEW_USER_DATA_DIR: path.join(directory, "profile"),
       CLIPVIEW_SMOKE_RAPID_NAVIGATION: "1",
+      CLIPVIEW_SMOKE_DECODER_RACE: "1",
+      CLIPVIEW_SMOKE_CORRUPT_IMAGE: corruptImage,
       CLIPVIEW_SMOKE_THUMBNAIL_WINDOW: "1",
     };
     delete env.ELECTRON_RUN_AS_NODE;
     await new Promise((resolve, reject) => {
       const child = spawn(require("electron"), [
         ".", path.join(media, "page000.png"), "--smoke-test",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
       ], { cwd: path.join(__dirname, ".."), env, windowsHide: true, stdio: "inherit" });
       let timedOut = false;
       const timeout = setTimeout(() => {
