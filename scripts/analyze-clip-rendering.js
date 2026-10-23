@@ -12,7 +12,7 @@ async function run() {
   const output = path.resolve(process.argv[3] || path.join(__dirname, "..", "..", "..", "outputs", "clip-renderer-research"));
   fs.mkdirSync(output, { recursive: true });
   const report = { runtime: "Independent CLIP decoding; no CSP executable/DLL", files: [] };
-  for (const file of fs.readdirSync(directory).filter((file) => /^page00(0[6-9]|1[0-9])\.clip$/i.test(file))) {
+  for (const file of fs.readdirSync(directory).filter((file) => /\.(clip|csp)$/i.test(file)).sort()) {
     const filePath = path.join(directory, file);
     const clip = await extractClipData(filePath);
     const layers = flatten(clip.layerDocument.layers);
@@ -39,7 +39,8 @@ async function run() {
       changedPixelPercent: Number((changed / (original.length / 4) * 100).toFixed(3)), renderMs: Math.round(performance.now() - start),
     };
     report.files.push(row);
-    fs.writeFileSync(path.join(output, file.replace(/\.clip$/i, "-independent.png")), png);
+    fs.writeFileSync(path.join(output, file.replace(/\.(clip|csp)$/i, "-original.png")), clip.preview);
+    fs.writeFileSync(path.join(output, file.replace(/\.(clip|csp)$/i, "-independent.png")), png);
     console.log(JSON.stringify(row));
   }
   fs.writeFileSync(path.join(output, "rendering-report.json"), `${JSON.stringify(report, null, 2)}\n`);

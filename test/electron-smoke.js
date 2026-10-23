@@ -31,6 +31,9 @@ function attachElectronSmoke({
   optionalAssociationCount,
   fileAssociationSupported,
 }) {
+  // Layer tests use DOM actions, so keep the window from intercepting the
+  // user's typing while these checks run on their desktop.
+  if (process.env.CLIPVIEW_SMOKE_LAYER_DETAILS === "1") mainWindow.setFocusable(false);
   mainWindow.webContents.once("did-finish-load", async () => {
     try {
       await wait(500);
@@ -485,14 +488,14 @@ function attachElectronSmoke({
             throw new Error("Layer kinds are missing or inconsistent in the list");
           }
           const results = [];
-          for (const type of ["raster", "vector", "text"]) {
-            const layer = all.find((entry) => entry.type === type);
+          for (const type of ["raster", "vector", "text", "balloon"]) {
+            const layer = all.find((entry) => type === "balloon" ? entry.kind === "balloon" : entry.type === type && entry.kind !== "balloon");
             if (!layer) continue;
             const before = performance.now();
             selectLayer(layer.id);
             const details = document.getElementById("layerDetailList").textContent;
             if (!details.includes(layer.typeLabel)) throw new Error("Selected layer kind is missing");
-            if (type === "text") {
+            if (type === "text" || type === "balloon") {
               if (document.querySelectorAll(".layer-text-object").length !== layer.textObjects.length) throw new Error("Text objects are missing");
               if (!document.getElementById("layerTextObjects").textContent.includes("쓰기 방향")) throw new Error("Text properties are missing");
             }
@@ -553,8 +556,8 @@ function attachElectronSmoke({
             const rows = [...document.querySelectorAll(".layer-row")];
             const objects = [...document.querySelectorAll(".layer-text-object")];
             const results = [];
-            for (const type of ["raster", "group"]) {
-              const layer = all.find((entry) => entry.type === type && entry.toggleAvailable && layerIsVisible(entry.id));
+            for (const type of ["raster", "vector", "text", "balloon", "group"]) {
+              const layer = all.find((entry) => (type === "balloon" ? entry.kind === "balloon" : entry.type === type && entry.kind !== "balloon") && entry.toggleAvailable && layerIsVisible(entry.id));
               if (!layer) continue;
               const button = state.layerRows.get(layer.id)?.querySelector(".layer-visibility");
               if (!button) continue;
@@ -624,6 +627,11 @@ function attachElectronSmoke({
         if (!(image.naturalWidth || image.videoWidth) || image.classList.contains("hidden")) return null;
         const imageRect = image.getBoundingClientRect();
         return {
+          fitMode: state.fitMode,
+          zoom: state.zoom,
+          naturalWidth: state.naturalWidth,
+          naturalHeight: state.naturalHeight,
+          transform: image.style.transform,
           deltaX: imageRect.left + imageRect.width / 2 - (stage.left + stage.width / 2),
           deltaY: imageRect.top + imageRect.height / 2 - (stage.top + stage.height / 2),
           gapX: stage.width - imageRect.width,

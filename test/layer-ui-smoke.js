@@ -6,7 +6,9 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 async function run() {
-  const sample = path.join(__dirname, "samples", "RecWild1_KR", "page0006.clip");
+  const sample = process.argv[2]
+    ? path.resolve(process.argv[2])
+    : path.join(__dirname, "samples", "RecWild1_KR", "page0006.clip");
   if (!fs.existsSync(sample)) {
     console.log("CLIP layer UI smoke skipped: local samples are not present");
     return;
@@ -22,7 +24,9 @@ async function run() {
     };
     delete env.ELECTRON_RUN_AS_NODE;
     await new Promise((resolve, reject) => {
-      const child = spawn(require("electron"), [".", sample, "--smoke-test"], {
+      const child = spawn(require("electron"), [".", sample, "--smoke-test",
+        "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding"], {
         cwd: path.join(__dirname, ".."), env, windowsHide: true, stdio: "inherit",
       });
       let timedOut = false;

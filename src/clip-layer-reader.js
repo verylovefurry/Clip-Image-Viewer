@@ -43,11 +43,14 @@ function extractClipMipmapSources(db, column) {
     "LayerLayerMaskMipmap",
     "ResizableOriginalMipmap",
     "ComicFrameLineMipmap",
+    "BrushPatternImage",
   ].includes(column)) return {};
   try {
     const layers = queryRows(
       db,
-      `SELECT MainId, "${column}" AS SourceMipmap FROM Layer`,
+      column === "BrushPatternImage"
+        ? "SELECT MainId, Mipmap AS SourceMipmap FROM BrushPatternImage"
+        : `SELECT MainId, "${column}" AS SourceMipmap FROM Layer`,
     );
     const mipmaps = new Map(queryRows(
       db,
@@ -121,6 +124,10 @@ function extractClipObjectSources(db) {
 
 function extractClipBorderSources(db) {
   return extractClipMipmapSources(db, "ComicFrameLineMipmap");
+}
+
+function extractClipBrushPatternSources(db) {
+  return extractClipMipmapSources(db, "BrushPatternImage");
 }
 
 function extractClipThumbnailSources(db) {
@@ -261,6 +268,32 @@ function extractClipVectorSources(db) {
   }
 }
 
+function parseBrushSizeEffector(value, graphs) {
+  const data = value ? Buffer.from(value) : Buffer.alloc(0);
+  const result = {};
+  if (data.length < 4) return result;
+  const flags = data.readUInt32BE(0);
+  if (!(flags & 1)) return result;
+  let offset = 4;
+  // Modulators are optional, packed in flag order, not fixed-position fields.
+  for (const [flag, name, hasGraph] of [
+    [0x10, "pressure", true], [0x20, "velocity", true],
+    [0x40, "smooth", false], [0x80, "random", false], [0x100, "tilt", false],
+  ]) {
+    if (!(flags & flag)) continue;
+    const size = hasGraph ? 8 : 4;
+    if (offset + size > data.length) break;
+    const minimum = data.readFloatBE(offset);
+    result[`${name}Enabled`] = Number.isFinite(minimum);
+    result[`${name}Minimum`] = Number.isFinite(minimum) ? Math.max(0, Math.min(1, minimum)) : 0;
+    if (hasGraph) result[`${name}Graph`] = graphs.get(data.readUInt32BE(offset + 4)) || null;
+    offset += size;
+  }
+  const maximum = result.velocityEnabled && offset + 4 <= data.length ? data.readFloatBE(offset) : 1;
+  result.velocityMaximum = Number.isFinite(maximum) ? Math.max(0, Math.min(1, maximum)) : 1;
+  return result;
+}
+
 function extractClipBrushStyles(db) {
   try {
     const graphs = new Map();
@@ -287,6 +320,19 @@ function extractClipBrushStyles(db) {
     const optionalColumn = (name) => (
       columns.has(name) ? name : `NULL AS ${name}`
     );
+    const patterns = new Map();
+    try {
+      for (const row of queryRows(db, "SELECT MainId, ImageIndex, OrderType, Reverse2 FROM BrushPatternStyle")) {
+        const data = row.ImageIndex ? Buffer.from(row.ImageIndex) : Buffer.alloc(0);
+        const imageIds = [];
+        for (let offset = 0; offset + 4 <= data.length && imageIds.length < 256; offset += 4) {
+          imageIds.push(String(data.readUInt32BE(offset)));
+        }
+        patterns.set(Number(row.MainId), { imageIds, order: Number(row.OrderType) || 0, reverse: Number(row.Reverse2) || 0 });
+      }
+    } catch {
+      // Older documents can use analytic brushes without an image table.
+    }
     const styles = {};
     for (const row of queryRows(db, `
       SELECT MainId, SizeEffector,
@@ -294,29 +340,24 @@ function extractClipBrushStyles(db) {
         ${optionalColumn("RotationBase")},
         ${optionalColumn("AntiAlias")},
         ${optionalColumn("Hardness")},
-        ${optionalColumn("PatternStyle")}
+        ${optionalColumn("PatternStyle")},
+        ${optionalColumn("IntervalBase")},
+        ${optionalColumn("AutoIntervalType")},
+        ${optionalColumn("RotationEffector")},
+        ${optionalColumn("SprayFlag")},
+        ${optionalColumn("SpraySizeBase")},
+        ${optionalColumn("SpraySizeEffector")},
+        ${optionalColumn("SprayBias")},
+        ${optionalColumn("RotationEffectorInSpray")},
+        ${optionalColumn("RotationRandomInSpray")},
+        ${optionalColumn("DualStyleIndex")}
       FROM BrushStyle
     `)) {
-      const data = row.SizeEffector ? Buffer.from(row.SizeEffector) : null;
-      const pressureMinimum = data?.length >= 12 ? data.readFloatBE(4) : 0;
-      const pressureGraph = data?.length >= 12
-        ? graphs.get(data.readUInt32BE(8)) || null
-        : null;
-      let velocityMinimum = 1;
-      let velocityGraph = null;
-      if (data?.length >= 20) {
-        velocityMinimum = data.readFloatBE(12);
-        velocityGraph = graphs.get(data.readUInt32BE(16)) || null;
-      }
-      const thickness = Number(row.ThicknessBase);
+      const thickness = row.ThicknessBase == null ? 1 : Number(row.ThicknessBase);
       const rotation = Number(row.RotationBase);
       styles[String(Number(row.MainId))] = {
-        pressureEnabled: Boolean(pressureGraph),
-        pressureMinimum: Number.isFinite(pressureMinimum) ? pressureMinimum : 0,
-        pressureGraph,
-        velocityEnabled: Boolean(velocityGraph),
-        velocityMinimum: Number.isFinite(velocityMinimum) ? velocityMinimum : 1,
-        velocityGraph,
+        id: String(Number(row.MainId)),
+        ...parseBrushSizeEffector(row.SizeEffector, graphs),
         thickness: Number.isFinite(thickness)
           ? Math.max(0.01, Math.min(1, thickness))
           : 1,
@@ -324,6 +365,17 @@ function extractClipBrushStyles(db) {
         antiAlias: Number(row.AntiAlias) || 0,
         hardness: Number.isFinite(Number(row.Hardness)) ? Number(row.Hardness) : 1,
         patternStyle: Number(row.PatternStyle) || 0,
+        pattern: patterns.get(Number(row.PatternStyle)) || null,
+        interval: row.IntervalBase == null ? 0.1 : Math.max(0.001, Number(row.IntervalBase) || 0.1),
+        autoInterval: Number(row.AutoIntervalType) || 0,
+        rotationEffector: Number(row.RotationEffector) || 0,
+        spray: Number(row.SprayFlag) || 0,
+        spraySize: Math.max(0, Number(row.SpraySizeBase) || 0),
+        sprayEffector: parseBrushSizeEffector(row.SpraySizeEffector, graphs),
+        sprayBias: Math.max(-1, Math.min(1, Number(row.SprayBias) || 0)),
+        sprayRotationEffector: Number(row.RotationEffectorInSpray) || 0,
+        sprayRotationRandom: Number(row.RotationRandomInSpray) || 0,
+        dualStyleId: String(Number(row.DualStyleIndex) || 0),
       };
     }
     return styles;
@@ -957,14 +1009,12 @@ function vectorStrokeInfo(data, offset, brushStyles) {
   ) {
     return null;
   }
-  let styleId = String(data.readUInt32BE(offset + styleOffset));
-  // Extended stroke headers place the radius/seed at the end, with extra
-  // style descriptor words before them (frame borders use this layout).
   const radiusOffset = headerSize - 12;
-  for (let position = styleOffset; position + 4 <= radiusOffset; position += 4) {
-    const candidate = String(data.readUInt32BE(offset + position));
-    if (brushStyles?.[candidate]) { styleId = candidate; break; }
-  }
+  const descriptor = data.readUInt32BE(offset + styleOffset);
+  const extendedStyle = radiusOffset - styleOffset >= 12;
+  const styleId = String(data.readUInt32BE(offset + styleOffset + (extendedStyle ? 4 : 0)));
+  const hasFill = extendedStyle && Boolean(descriptor & 0x20) &&
+    data.readUInt32BE(offset + styleOffset + 8) !== 0;
   const baseSize = data.readDoubleBE(offset + radiusOffset) * 2;
   if (!Number.isFinite(baseSize) || baseSize <= 0 || baseSize > 10000) return null;
   return {
@@ -972,6 +1022,7 @@ function vectorStrokeInfo(data, offset, brushStyles) {
     headerSize,
     pointCount,
     pointStride,
+    pointDataSize,
     styleId,
     style: brushStyles?.[styleId] || null,
     color: [40, 44, 48].map((delta) => {
@@ -979,6 +1030,12 @@ function vectorStrokeInfo(data, offset, brushStyles) {
       return channel <= 0xffff ? channel >>> 8 : channel >>> 24;
     }),
     opacity: data.readDoubleBE(offset + 64),
+    closed: Boolean(data.readUInt32BE(offset + 20) & 8) || hasFill,
+    fillColor: hasFill ? [52, 56, 60].map((delta) => {
+      const channel = data.readUInt32BE(offset + delta);
+      return channel <= 0xffff ? channel >>> 8 : channel >>> 24;
+    }) : null,
+    seed: data.readUInt32BE(offset + headerSize - 4),
   };
 }
 
@@ -1033,12 +1090,29 @@ function vectorRecord(data, offset, maximumX, maximumY, strokeInfo = null) {
     if (style?.velocityEnabled) {
       const velocityCurve = evaluateBrushGraph(style.velocityGraph, velocity);
       const velocityMinimum = Math.max(0, Math.min(1, style.velocityMinimum || 0));
-      velocityFactor = velocityMinimum + (1 - velocityMinimum) * velocityCurve;
+      velocityFactor = velocityMinimum + ((style.velocityMaximum ?? 1) - velocityMinimum) * velocityCurve;
     }
+    const smoothFactor = style?.smoothEnabled
+      ? 1 - Math.max(0, Math.min(1, smooth || 0)) * (1 - style.smoothMinimum) : 1;
+    const tiltFactor = style?.tiltEnabled
+      ? style.tiltMinimum + Math.min(1, Math.abs(tilt || 0)) * (1 - style.tiltMinimum) : 1;
     const sizeFactor = Number.isFinite(storedSize) && storedSize > 0 && storedSize <= 10000 ? storedSize : 1;
-    width = Math.max(0.01, strokeInfo.baseSize * pressureFactor * velocityFactor * sizeFactor);
+    width = Math.max(0.01, Math.min(10000, strokeInfo.baseSize * sizeFactor *
+      (flags & 0x1000 ? 1 : pressureFactor * velocityFactor * smoothFactor * tiltFactor)));
     thickness = style?.thickness || 1;
-    rotation = style?.rotation || 0;
+    const angle = data.readFloatBE(offset + 48);
+    rotation = style?.rotationEffector & 0x10 && Number.isFinite(angle)
+      ? angle : style?.rotation || 0;
+  }
+  const handles = [];
+  if (strokeInfo && [16, 32].includes(strokeInfo.pointStride - strokeInfo.pointDataSize)) {
+    for (let index = strokeInfo.pointDataSize; index + 16 <= strokeInfo.pointStride; index += 16) {
+      const hx = data.readDoubleBE(offset + index);
+      const hy = data.readDoubleBE(offset + index + 8);
+      if (Number.isFinite(hx) && Number.isFinite(hy) && Math.abs(hx) <= maximumX && Math.abs(hy) <= maximumY) {
+        handles.push({ x: hx, y: hy });
+      }
+    }
   }
   return {
     x,
@@ -1055,6 +1129,7 @@ function vectorRecord(data, offset, maximumX, maximumY, strokeInfo = null) {
     color: strokeInfo?.color || null,
     opacity: Number.isFinite(strokeInfo?.opacity) ? Math.max(0, Math.min(1, strokeInfo.opacity)) : 1,
     brushId: strokeInfo?.styleId || "",
+    handles,
   };
 }
 
@@ -1062,6 +1137,7 @@ function decodeClipVector(source, entries, canvasWidth, canvasHeight, brushStyle
   const maximumX = Math.max(4096, Math.ceil(canvasWidth * 2));
   const maximumY = Math.max(4096, Math.ceil(canvasHeight * 2));
   const segments = [];
+  const strokes = [];
   let pointCount = 0;
   for (const entry of entries || []) {
     const data = readExternalChunk(source, entry.offset, entry.externalId);
@@ -1090,7 +1166,11 @@ function decodeClipVector(source, entries, canvasWidth, canvasHeight, brushStyle
         if (point) segment.push(point);
         pointCount += 1;
       }
-      if (segment.length) segments.push(segment);
+      if (segment.length) {
+        segments.push(segment);
+        strokes.push({ points: segment, closed: strokeInfo.closed, fillColor: strokeInfo.fillColor,
+          brush: strokeInfo.style, dualBrush: brushStyles[strokeInfo.style?.dualStyleId] || null, seed: strokeInfo.seed });
+      }
       offset += strokeInfo.headerSize +
         strokeInfo.pointCount * strokeInfo.pointStride;
     }
@@ -1106,6 +1186,7 @@ function decodeClipVector(source, entries, canvasWidth, canvasHeight, brushStyle
   }
   return {
     segments,
+    strokes,
     bounds,
   };
 }
@@ -1117,6 +1198,7 @@ module.exports = {
   decodeClipVector,
   extractClipBorderSources,
   extractClipBrushStyles,
+  extractClipBrushPatternSources,
   extractClipMaskSources,
   extractClipObjectSources,
   extractClipRasterSources,

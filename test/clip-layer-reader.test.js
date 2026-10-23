@@ -9,6 +9,7 @@ const {
   decodeClipMaskForCanvas,
   decodeClipVector,
   extractClipBrushStyles,
+  extractClipBrushPatternSources,
   extractClipRasterSources,
   extractClipThumbnailSources,
   extractClipTextSources,
@@ -307,6 +308,17 @@ async function run() {
   ])), [{ externalId: Buffer.from(vectorId).toString("hex"), offset: 0 }], 100, 100, { 2: { pressureEnabled: false } });
   assert.equal(extendedFrame.segments[0][0].width, 5, "extended frame headers store the radius after extra style words");
   assert.equal(extendedFrame.segments[0][0].brushId, "2");
+  frameHeader.writeUInt32BE(0x130, 76);
+  frameHeader.writeUInt32BE(8, 20);
+  [52, 56, 60].forEach((offset) => frameHeader.writeUInt32BE(0xffffffff, offset));
+  const filledVector = decodeClipVector(makeExternalChunk(vectorId, Buffer.concat([
+    frameHeader, makeVectorRecord(20, 20), makeVectorRecord(30, 30),
+  ])), [{ externalId: Buffer.from(vectorId).toString("hex"), offset: 0 }], 100, 100,
+  { 304: { pressureEnabled: true }, 2: { pressureEnabled: false } });
+  assert.equal(filledVector.segments[0][0].brushId, "2", "extended descriptor flags are not mistaken for a brush ID");
+  assert.deepEqual(filledVector.strokes[0].fillColor, [255, 255, 255]);
+  assert(filledVector.strokes[0].closed);
+  assert.equal(extendedVector.segments[0][0].handles.length, 1, "curve control data survives point decoding");
 
   const SQL = await initSqlJs({
     locateFile: (file) => require.resolve(`sql.js/dist/${file}`),
@@ -330,6 +342,10 @@ async function run() {
     MainId INTEGER, SizeEffector BLOB, ThicknessBase REAL, RotationBase REAL,
     AntiAlias INTEGER, Hardness REAL, PatternStyle INTEGER
   )`);
+  db.run("CREATE TABLE BrushPatternStyle (MainId INTEGER, ImageIndex BLOB, OrderType INTEGER, Reverse2 INTEGER)");
+  db.run("CREATE TABLE BrushPatternImage (MainId INTEGER, Mipmap INTEGER)");
+  db.run("INSERT INTO BrushPatternStyle VALUES (20, ?, 0, 0)", [u32(6)]);
+  db.run("INSERT INTO BrushPatternImage VALUES (6, 10)");
   db.run("INSERT INTO Layer VALUES (7, 10, 40)");
   db.run("INSERT INTO LayerThumbnail VALUES (40, 30)");
   db.run("INSERT INTO Mipmap VALUES (10, 20)");
@@ -357,16 +373,29 @@ async function run() {
   graphInsert.run([graphPoints]);
   graphInsert.free();
   const sizeEffector = Buffer.alloc(12);
-  sizeEffector.writeUInt32BE(1, 0);
+  sizeEffector.writeUInt32BE(0x11, 0);
   sizeEffector.writeFloatBE(0.2, 4);
   sizeEffector.writeUInt32BE(3, 8);
   const brushInsert = db.prepare(
-    "INSERT INTO BrushStyle VALUES (2, ?, 0.7, 79, 1, 1, 0)",
+    "INSERT INTO BrushStyle VALUES (2, ?, 0.7, 79, 1, 1, 20)",
   );
   brushInsert.run([sizeEffector]);
   brushInsert.free();
+  const smoothEffector = Buffer.alloc(20);
+  smoothEffector.writeUInt32BE(0x51, 0);
+  smoothEffector.writeFloatBE(0.16, 4);
+  smoothEffector.writeUInt32BE(3, 8);
+  smoothEffector.writeFloatBE(0.06, 12);
+  smoothEffector.writeUInt32BE(3, 16);
+  db.run("INSERT INTO BrushStyle VALUES (4, ?, 1, 0, 1, 1, 0)", [smoothEffector]);
+  const velocityEffector = Buffer.alloc(20);
+  velocityEffector.writeUInt32BE(0x31, 0);
+  velocityEffector.writeFloatBE(0, 4); velocityEffector.writeUInt32BE(3, 8);
+  velocityEffector.writeFloatBE(0.25, 12); velocityEffector.writeUInt32BE(3, 16);
+  db.run("INSERT INTO BrushStyle VALUES (5, ?, 1, 0, 1, 1, 0)", [velocityEffector]);
   const brushStyles = extractClipBrushStyles(db);
   const sources = extractClipRasterSources(db);
+  const brushPatternSources = extractClipBrushPatternSources(db);
   const thumbnailSources = extractClipThumbnailSources(db);
   const vectorSources = extractClipVectorSources(db);
   const textSources = extractClipTextSources(db, [{ id: "7", textObjects: [{ index: 0, attributes: { renderCacheId: 30, bounds: [10, 20, 11, 21] } }] }]);
@@ -384,10 +413,26 @@ async function run() {
   assert.equal(brushStyles["2"].pressureEnabled, true);
   assert.equal(brushStyles["2"].thickness, 0.7);
   assert.equal(brushStyles["2"].rotation, 79);
+  assert.deepEqual(brushStyles["2"].pattern.imageIds, ["6"]);
+  assert.equal(brushPatternSources["6"][0].width, 2, "brush tips follow their own mipmap chain");
   assert.deepEqual(brushStyles["2"].pressureGraph, [
     { x: 0, y: 0 },
     { x: 1, y: 1 },
   ]);
+  assert.equal(brushStyles["4"].pressureEnabled, true);
+  assert.equal(brushStyles["4"].smoothEnabled, true);
+  assert(!brushStyles["4"].velocityEnabled, "smooth parameters and trailing words are not velocity graph references");
+  assert(Math.abs(brushStyles["4"].smoothMinimum - 0.06) < 1e-6);
+  const smoothVector = decodeClipVector(makeExternalChunk(vectorId, makeVectorStroke([
+    makeVectorRecord(20, 24, 8, 1, 0.5),
+  ], 10, 4)), [{ externalId: Buffer.from(vectorId).toString("hex"), offset: 0 }], 100, 100, brushStyles);
+  assert(Math.abs(smoothVector.segments[0][0].width - 5.9) < 1e-5, "smoothness modulates size without a fictitious velocity multiplier");
+  assert(brushStyles["5"].velocityEnabled);
+  assert(!brushStyles["5"].smoothEnabled);
+  const velocityVector = decodeClipVector(makeExternalChunk(vectorId, makeVectorStroke([
+    makeVectorRecord(20, 24, 8, 0.5, 0.5),
+  ], 10, 5)), [{ externalId: Buffer.from(vectorId).toString("hex"), offset: 0 }], 100, 100, brushStyles);
+  assert.equal(velocityVector.segments[0][0].width, 6.25, "a real velocity flag applies its own curve");
 
   console.log("clip layer reader tests passed");
 }

@@ -9,6 +9,7 @@ const {
   decodeClipVector,
   extractClipBorderSources,
   extractClipBrushStyles,
+  extractClipBrushPatternSources,
   extractClipMaskSources,
   extractClipObjectSources,
   extractClipRasterSources,
@@ -17,6 +18,7 @@ const {
   extractClipVectorSources,
 } = require("./clip-layer-reader");
 const { renderCachedClipText } = require("./clip-text-renderer");
+const { createPatternStroke, stampPattern, mergePatternStroke } = require("./clip-brush-renderer");
 const { compositeRgba, modeCode: clipCompositeMode } = require("./clip-compositor");
 const {
   BPG_EXTENSIONS,
@@ -73,6 +75,10 @@ const clipObjectDecodeCache = new Map();
 const CLIP_OBJECT_DECODE_CACHE_LIMIT = 12;
 const clipVectorDecodeCache = new Map();
 const CLIP_VECTOR_DECODE_CACHE_LIMIT = 32;
+const clipBrushPatternCache = new WeakMap();
+const clipVectorPngCache = new Map();
+let clipVectorPngCacheBytes = 0;
+const MAX_VECTOR_PNG_CACHE_BYTES = 48 * 1024 * 1024;
 const clipMaskDecodeCache = new Map();
 const CLIP_MASK_DECODE_CACHE_LIMIT = 12;
 const psdNodeRenderCache = new WeakMap();
@@ -1126,6 +1132,9 @@ function clipLayerClassification(row, type, gradient, features) {
     return { kind: frame ? "frame-folder" : "group", typeLabel: frame ? "컷 테두리 폴더" : "폴더", classificationSource: frame ? "컷 테두리 속성 · 폴더 구조" : "폴더 구조" };
   }
   if (type === "text") {
+    if (Number(row.TextLayerType) === 1 || numberOrZero(row.VectorNormalBalloonIndex)) {
+      return { kind: "balloon", typeLabel: "말풍선 · 텍스트", classificationSource: "말풍선 종류 · 벡터 도형/텍스트 개체" };
+    }
     return {
       kind: storyType === 1 ? "story-information" : storyType === 2 ? "page-number" : "text",
       typeLabel: storyType === 1 ? "텍스트 (작품 정보)" : storyType === 2 ? "텍스트 (페이지 번호)" : "텍스트",
@@ -1211,7 +1220,7 @@ function clipLayerDefinition(row, nested, features = {}) {
       attributesVersion: row.TextLayerAttributesVersion ?? null,
       version: row.TextLayerVersion ?? null,
     } : null,
-    vectorInfo: hasVectorInfo && type !== "raster" && type !== "text" ? {
+    vectorInfo: hasVectorInfo && type !== "raster" ? {
       kindCode: row.VectorNormalType ?? null,
       strokeSourceId: numberOrZero(row.VectorNormalStrokeIndex),
       fillSourceId: numberOrZero(row.VectorNormalFillIndex),
@@ -1370,7 +1379,9 @@ function applyClipLayerAvailability(
               : "저장 레이어 래스터(효과 근사)"
             : "CSP 저장 레이어 래스터"
           : layer.vectorAvailable
-              ? "벡터 경로 재구성(근사)"
+              ? layer.kind === "balloon"
+                ? "말풍선 도형 · 텍스트 개체 합성(근사)"
+                : "벡터 경로 재구성(근사)"
             : layer.textRasterAvailable
               ? `CSP 저장 텍스트 개체 래스터 (${layer.textRasterCount}개)`
             : layer.objectRasterAvailable && layer.resizable
@@ -1450,6 +1461,7 @@ async function extractClipData(input, { previewOnly = false } = {}) {
       }
       const layerDocument = extractClipLayerDocument(db, canvasRow);
       const brushStyles = extractClipBrushStyles(db);
+      const brushPatternSources = extractClipBrushPatternSources(db);
       const rasterSources = extractClipRasterSources(db);
       const thumbnailSources = extractClipThumbnailSources(db);
       const maskSources = extractClipMaskSources(db);
@@ -1506,6 +1518,7 @@ async function extractClipData(input, { previewOnly = false } = {}) {
         borderSources,
         textSources,
         brushStyles,
+        brushPatternSources,
         source: input,
       };
     } finally {
@@ -1952,6 +1965,102 @@ function cachedClipVector(item, clip, layer) {
   return decoded;
 }
 
+function clipBrushPatternKey(stroke) {
+  return `${stroke.brush?.id || stroke.points[0]?.brushId}:${stroke.points[0]?.color?.join(",")}:${stroke.fillColor?.join(",")}`;
+}
+
+function clipVectorBrushStrokes(decoded) {
+  return (decoded.strokes || decoded.segments.map((points) => ({ points })))
+    .flatMap((stroke) => stroke.dualBrush
+      ? [stroke, { ...stroke, brush: stroke.dualBrush, dualBrush: null, fillColor: null }]
+      : [stroke]);
+}
+
+async function clipBrushPatterns(clip, decoded) {
+  let cache = clipBrushPatternCache.get(clip);
+  if (!cache) { cache = new Map(); clipBrushPatternCache.set(clip, cache); }
+  const patterns = new Map();
+  for (const stroke of clipVectorBrushStrokes(decoded)) {
+    const imageId = stroke.brush?.pattern?.imageIds.find((id) => clip.brushPatternSources?.[id]?.length);
+    if (!imageId) continue;
+    const key = clipBrushPatternKey(stroke);
+    if (patterns.has(key)) continue;
+    if (!cache.has(key)) {
+      if (cache.size >= 32) cache.delete(cache.keys().next().value);
+      cache.set(key, (async () => {
+        const decoded = decodeClipLayer(clip.source, clip.brushPatternSources[imageId], 1024);
+        if (!decoded) return null;
+        const pixels = Buffer.from(decoded.data);
+        const main = stroke.points[0]?.color || [0, 0, 0];
+        const secondary = stroke.fillColor || [255, 255, 255];
+        let grayscale = true;
+        for (let offset = 0; offset < pixels.length && grayscale; offset += 4) {
+          if (pixels[offset + 3] && (pixels[offset] !== pixels[offset + 1] || pixels[offset] !== pixels[offset + 2])) grayscale = false;
+        }
+        for (let offset = 0; grayscale && offset < pixels.length; offset += 4) {
+          const value = pixels[offset] / 255;
+          for (let channel = 0; channel < 3; channel += 1) {
+            pixels[offset + channel] = Math.round(main[channel] * (1 - value) + secondary[channel] * value);
+          }
+        }
+        // Long strip tips need separate-axis sampling; this remains an
+        // approximation, not a complete CSP ribbon/brush-texture engine.
+        const elongated = Math.max(decoded.width, decoded.height) > Math.min(decoded.width, decoded.height) * 8;
+        const longest = Math.max(decoded.width, decoded.height);
+        const aspectX = elongated ? 1 : decoded.width / longest;
+        const aspectY = elongated ? 1 : decoded.height / longest;
+        const resized = await sharp(pixels, { raw: { width: decoded.width, height: decoded.height, channels: 4 } })
+          .resize(128, 128, { fit: "fill" }).raw().toBuffer();
+        const premultiplied = new Float32Array(resized.length);
+        for (let offset = 0; offset < resized.length; offset += 4) {
+          const alpha = resized[offset + 3] / 255;
+          for (let channel = 0; channel < 3; channel += 1) premultiplied[offset + channel] = resized[offset + channel] * alpha;
+          premultiplied[offset + 3] = resized[offset + 3];
+        }
+        return { pixels: premultiplied, width: 128, height: 128, aspectX, aspectY };
+      })());
+    }
+    const image = await cache.get(key);
+    if (image) patterns.set(key, image);
+  }
+  return patterns;
+}
+
+function clipCurvePosition(previous, point, ratio) {
+  const left = previous.handles || [];
+  const right = point.handles || [];
+  const inverse = 1 - ratio;
+  if (left.length === 2 && right.length === 2) {
+    return {
+      x: inverse ** 3 * previous.x + 3 * inverse ** 2 * ratio * left[1].x + 3 * inverse * ratio ** 2 * right[0].x + ratio ** 3 * point.x,
+      y: inverse ** 3 * previous.y + 3 * inverse ** 2 * ratio * left[1].y + 3 * inverse * ratio ** 2 * right[0].y + ratio ** 3 * point.y,
+    };
+  }
+  if (left.length === 1) {
+    return {
+      x: inverse ** 2 * previous.x + 2 * inverse * ratio * left[0].x + ratio ** 2 * point.x,
+      y: inverse ** 2 * previous.y + 2 * inverse * ratio * left[0].y + ratio ** 2 * point.y,
+    };
+  }
+  return { x: previous.x + (point.x - previous.x) * ratio, y: previous.y + (point.y - previous.y) * ratio };
+}
+
+function clipClosedVectorPath(points, scale, offsetX, offsetY) {
+  if (points.length < 3) return "";
+  const xy = (point) => `${point.x * scale + offsetX},${point.y * scale + offsetY}`;
+  let path = `M${xy(points[0])}`;
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    if (current.handles?.length === 2 && next.handles?.length === 2) {
+      path += ` C${xy(current.handles[1])} ${xy(next.handles[0])} ${xy(next)}`;
+    } else if (current.handles?.length === 1) {
+      path += ` Q${xy(current.handles[0])} ${xy(next)}`;
+    } else path += ` L${xy(next)}`;
+  }
+  return `${path} Z`;
+}
+
 function clipVectorSvg(
   layer,
   decoded,
@@ -1960,6 +2069,8 @@ function clipVectorSvg(
   thumbnail = false,
   nativeWidth = width,
   nativeHeight = height,
+  patterns = new Map(),
+  patternSurfaces = {},
 ) {
   const bounds = decoded.bounds;
   const padding = thumbnail ? 5 : 0;
@@ -1967,11 +2078,11 @@ function clipVectorSvg(
   const frameWidth = frameVector ? decoded.segments.reduce((width, segment) => (
     segment.reduce((width, point) => Math.max(width, point.width), width)
   ), 0) : 0;
-  const segments = frameVector
-    ? decoded.segments.map((segment) => (
-        segment.length >= 3 ? [...segment, segment[0]] : segment
-      ))
-    : decoded.segments;
+  const strokes = clipVectorBrushStrokes(decoded);
+  const segments = strokes.map((stroke) => (
+    (frameVector || stroke.closed) && stroke.points.length >= 3
+      ? [...stroke.points, stroke.points[0]] : stroke.points
+  ));
   const pointWidth = (point) => point.width;
   const edgeWidth = Math.max(0, Number(layer.edgeEffect?.width) || 0);
   const geometryPadding = Math.max(edgeWidth, frameWidth / 2);
@@ -1998,26 +2109,36 @@ function clipVectorSvg(
     : [28, 32, 38];
   const stamps = [];
   const strokeBodies = [];
-  const pairStepCount = (previous, point) => {
+  const pairStepCount = (previous, point, stroke) => {
     const distance = Math.hypot(point.x - previous.x, point.y - previous.y) * scale;
     const minimumThickness = Math.min(
       pointWidth(previous) * previous.thickness,
       pointWidth(point) * point.thickness,
     ) * scale;
-    const spacing = Math.max(0.25, Math.min(1, minimumThickness * 0.4));
+    const brush = stroke?.brush;
+    const spacing = brush?.pattern
+      ? Math.max(0.5, minimumThickness * (brush.autoInterval ? 0.15 : brush.interval))
+      : Math.max(0.25, Math.min(1, minimumThickness * 0.4));
     return Math.max(1, Math.ceil(distance / spacing));
   };
   let desiredStampCount = segments.length;
-  for (const segment of segments) {
+  for (const [strokeIndex, segment] of segments.entries()) {
     for (let index = 1; index < segment.length; index += 1) {
-      desiredStampCount += pairStepCount(segment[index - 1], segment[index]);
+      desiredStampCount += pairStepCount(segment[index - 1], segment[index], strokes[strokeIndex]);
     }
   }
   const stampReduction = Math.max(1, desiredStampCount / MAX_VECTOR_STAMPS);
-  const appendStamp = (previous, point, ratio) => {
-    const x = (previous.x + (point.x - previous.x) * ratio) * scale + offsetX;
-    const y = (previous.y + (point.y - previous.y) * ratio) * scale + offsetY;
-    const brushWidth = Math.max(
+  let randomState = 1;
+  let patternSurface = null;
+  const patternBudget = { visits: 0 };
+  // Saved seeds keep approximate scatter stable across toggles. The CSP
+  // brush engine's exact random sequence is not yet reproduced.
+  const random = () => { randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0; return randomState / 0x100000000; };
+  const appendStamp = (previous, point, ratio, pattern, brush) => {
+    const position = clipCurvePosition(previous, point, ratio);
+    let x = position.x * scale + offsetX;
+    let y = position.y * scale + offsetY;
+    let brushWidth = Math.max(
       0.01,
       pointWidth(previous) + (pointWidth(point) - pointWidth(previous)) * ratio,
     ) * scale;
@@ -2029,46 +2150,74 @@ function clipVectorSvg(
     let rotationDelta = (point.rotation - previous.rotation) % 360;
     if (rotationDelta > 180) rotationDelta -= 360;
     if (rotationDelta < -180) rotationDelta += 360;
-    const rotation = previous.rotation + rotationDelta * ratio;
+    let rotation = previous.rotation + rotationDelta * ratio;
+    if (brush?.spray && pattern) {
+      const angle = random() * Math.PI * 2;
+      const radius = brushWidth / 2 * random() ** ((1 + (brush.sprayBias || 0)) / 2);
+      x += Math.cos(angle) * radius;
+      y += Math.sin(angle) * radius;
+      const effector = brush.sprayEffector || {};
+      const sizeFactor = effector.randomEnabled ? effector.randomMinimum + random() * (1 - effector.randomMinimum) : 1;
+      brushWidth = Math.max(0.01, brush.spraySize * scale * sizeFactor);
+      if (brush.sprayRotationEffector & 0x80) rotation += random() * 360 * brush.sprayRotationRandom;
+    } else if (pattern && !(brush?.rotationEffector & 0x10)) {
+      rotation += Math.atan2(point.y - previous.y, point.x - previous.x) * 180 / Math.PI + 90;
+    }
     const radiusX = Math.max(0.005, brushWidth / 2);
     const radiusY = Math.max(0.005, radiusX * thickness);
+    if (pattern) {
+      stampPattern(patternSurface, pattern, x, y, brushWidth * pattern.aspectX,
+        brushWidth * thickness * pattern.aspectY, rotation, patternBudget);
+      return;
+    }
     stamps.push(`<ellipse cx="${x}" cy="${y}" rx="${radiusX}" ry="${radiusY}"
       transform="rotate(${rotation} ${x} ${y})"/>`);
   };
-  for (const segment of segments) {
+  for (const [strokeIndex, segment] of segments.entries()) {
     if (!segment.length) continue;
+    const brush = strokes[strokeIndex].brush;
+    randomState = (strokes[strokeIndex].seed || 1) ^ (Number(brush?.id) || 0);
+    const pattern = patterns.get(clipBrushPatternKey(strokes[strokeIndex]));
+    patternSurface = pattern
+      ? createPatternStroke(segment, width, height, scale, offsetX, offsetY, brush?.spraySize || 0) : null;
     const firstStamp = stamps.length;
-    const finishStroke = () => strokeBodies.push({ geometry: stamps.slice(firstStamp).join(""), color: segment[0].color || color, opacity: segment[0].opacity ?? 1 });
+    const finishStroke = () => {
+      if (pattern) {
+        const target = brush?.spray ? "after" : "before";
+        if (!patternSurfaces[target]) patternSurfaces[target] = Buffer.alloc(width * height * 4);
+        mergePatternStroke(patternSurfaces[target], patternSurface, width, segment[0].opacity ?? 1);
+      } else strokeBodies.push({ geometry: stamps.slice(firstStamp).join(""), color: segment[0].color || color, opacity: segment[0].opacity ?? 1, spray: Boolean(brush?.spray) });
+    };
     if (segment.length === 1) {
-      appendStamp(segment[0], segment[0], 0);
+      appendStamp(segment[0], segment[0], 0, pattern, brush);
       finishStroke();
       continue;
     }
-    appendStamp(segment[0], segment[0], 0);
+    appendStamp(segment[0], segment[0], 0, pattern, brush);
     for (let index = 1; index < segment.length; index += 1) {
       const previous = segment[index - 1];
       const point = segment[index];
       const steps = Math.max(1, Math.ceil(
-        pairStepCount(previous, point) / stampReduction,
+        pairStepCount(previous, point, strokes[strokeIndex]) / stampReduction,
       ));
       for (let step = 1; step <= steps; step += 1) {
-        appendStamp(previous, point, step / steps);
+        appendStamp(previous, point, step / steps, pattern, brush);
       }
     }
     finishStroke();
   }
-  const geometry = stamps.join("");
-  const edgeColor = layer.edgeEffect?.color || [255, 255, 255];
-  const edge = edgeWidth > 0
-    ? `<use href="#clip-vector-stamps" fill="rgb(${edgeColor.join(",")})"
-        stroke="rgb(${edgeColor.join(",")})"
-        stroke-width="${edgeWidth * scale * 2}" stroke-linejoin="round"/>`
-    : "";
+  const fills = strokes.filter((stroke) => stroke.fillColor).map((stroke) => (
+    `<path d="${clipClosedVectorPath(stroke.points, scale, offsetX, offsetY)}" fill="rgb(${stroke.fillColor.join(",")})" opacity="${stroke.points[0].opacity ?? 1}"/>`
+  )).join("");
+  const strokeTags = (spray) => strokeBodies.map((stroke, index) => stroke.spray === spray
+    ? `<use href="#clip-vector-stroke-${index}" fill="rgb(${stroke.color.join(",")})" opacity="${stroke.opacity}"/>` : "").join("");
   return Buffer.from(`
     <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
-      <defs><g id="clip-vector-stamps">${geometry}</g>${strokeBodies.map((stroke, index) => `<g id="clip-vector-stroke-${index}">${stroke.geometry}</g>`).join("")}</defs>
-      ${edge}
-      ${strokeBodies.map((stroke, index) => `<use href="#clip-vector-stroke-${index}" fill="rgb(${stroke.color.join(",")})" opacity="${stroke.opacity}"/>`).join("")}
+      <defs>
+        ${strokeBodies.map((stroke, index) => `<g id="clip-vector-stroke-${index}">${stroke.geometry}</g>`).join("")}</defs>
+      ${strokeTags(false)}
+      ${fills}
+      ${strokeTags(true)}
     </svg>
   `);
 }
@@ -2103,7 +2252,7 @@ async function applyClipFrameMask(input, decoded, width, height, layerDocument) 
     .toBuffer();
 }
 
-async function clipVectorPng(
+async function renderClipVectorPng(
   layer,
   decoded,
   width,
@@ -2111,6 +2260,7 @@ async function clipVectorPng(
   thumbnail = false,
   nativeWidth = width,
   nativeHeight = height,
+  patterns = new Map(),
 ) {
   const requestedScale = thumbnail ? 4 : 2;
   const availableScale = Math.max(1, Math.floor(Math.sqrt(
@@ -2119,7 +2269,8 @@ async function clipVectorPng(
   const renderScale = Math.min(requestedScale, availableScale);
   const renderWidth = width * renderScale;
   const renderHeight = height * renderScale;
-  let output = await sharp(clipVectorSvg(
+  const patternSurfaces = {};
+  const svg = clipVectorSvg(
     layer,
     decoded,
     renderWidth,
@@ -2127,12 +2278,32 @@ async function clipVectorPng(
     thumbnail,
     nativeWidth,
     nativeHeight,
-  )).png({ compressionLevel: 1 }).toBuffer();
+    patterns,
+    patternSurfaces,
+  );
+  let output = await sharp(svg).png({ compressionLevel: 1 }).toBuffer();
+  if (patternSurfaces.before) {
+    output = await sharp(patternSurfaces.before, { raw: { width: renderWidth, height: renderHeight, channels: 4 } })
+      .composite([{ input: output }]).png({ compressionLevel: 1 }).toBuffer();
+  }
+  if (patternSurfaces.after) {
+    output = await sharp(output).composite([{ input: patternSurfaces.after,
+      raw: { width: renderWidth, height: renderHeight, channels: 4 } }]).png({ compressionLevel: 1 }).toBuffer();
+  }
   if (renderScale > 1) {
     output = await sharp(output)
       .resize(width, height, { kernel: "lanczos3" })
       .png({ compressionLevel: 1 })
       .toBuffer();
+  }
+  if (layer.edgeEffect) {
+    const bounds = decoded.bounds;
+    const edgeWidth = Math.max(0, Number(layer.edgeEffect.width) || 0);
+    const scale = thumbnail
+      ? Math.min((width - 10) / Math.max(1, bounds.right - bounds.left + edgeWidth * 2),
+          (height - 10) / Math.max(1, bounds.bottom - bounds.top + edgeWidth * 2))
+      : Math.min(width / nativeWidth, height / nativeHeight);
+    output = await applyClipEdgeEffect(output, layer, width, height, { nativeWidth: width / scale, nativeHeight: height / scale });
   }
   if (thumbnail) {
     const color = Array.isArray(layer.drawColor) && layer.drawColor.length >= 3
@@ -2148,6 +2319,38 @@ async function clipVectorPng(
     }).composite([{ input: output }]).png({ compressionLevel: 7 }).toBuffer();
   }
   return output;
+}
+
+function clipVectorPng(layer, decoded, width, height, thumbnail = false, nativeWidth = width, nativeHeight = height, patterns = new Map()) {
+  let variants = clipVectorPngCache.get(decoded);
+  if (!variants) { variants = new Map(); clipVectorPngCache.set(decoded, variants); }
+  else { clipVectorPngCache.delete(decoded); clipVectorPngCache.set(decoded, variants); }
+  const key = JSON.stringify([width, height, thumbnail, nativeWidth, nativeHeight, layer.edgeEffect, layer.drawColor]);
+  if (variants.has(key)) return variants.get(key).promise;
+  const entry = { bytes: 0 };
+  entry.promise = renderClipVectorPng(layer, decoded, width, height, thumbnail, nativeWidth, nativeHeight, patterns)
+    .then((png) => {
+      if (clipVectorPngCache.get(decoded) === variants && variants.get(key) === entry) {
+        entry.bytes = png.length;
+        clipVectorPngCacheBytes += entry.bytes;
+        while (clipVectorPngCache.size > 32 || clipVectorPngCacheBytes > MAX_VECTOR_PNG_CACHE_BYTES) {
+          const oldest = clipVectorPngCache.keys().next().value;
+          for (const cached of clipVectorPngCache.get(oldest).values()) clipVectorPngCacheBytes -= cached.bytes;
+          clipVectorPngCache.delete(oldest);
+        }
+      }
+      return png;
+    }).catch((error) => {
+      if (variants.get(key) === entry) variants.delete(key);
+      throw error;
+    });
+  variants.set(key, entry);
+  while (variants.size > 3) {
+    const oldest = variants.keys().next().value;
+    clipVectorPngCacheBytes -= variants.get(oldest).bytes;
+    variants.delete(oldest);
+  }
+  return entry.promise;
 }
 
 async function clipMetadataThumbnail(layer, size, preview) {
@@ -2330,7 +2533,7 @@ async function loadLayerThumbnail(item, id, size = 58) {
   if (CLIP_EXTENSIONS.has(ext)) {
     const clip = await cachedClipData(item);
     const layer = clipLayerById(clip.layerDocument?.layers, id);
-    if (!layer || layer.children?.length) {
+    if (!layer || layer.type === "group" || layer.children?.length) {
       layerThumbnailCache.set(cacheKey, null);
       return null;
     }
@@ -2345,7 +2548,7 @@ async function loadLayerThumbnail(item, id, size = 58) {
       thumbnailSize * 2,
       { color: layer.drawColor },
     );
-    const vector = !decoded && layer.vectorAvailable
+    const vector = !decoded && layer.vectorAvailable && !layer.textObjects?.some((object) => object.text)
       ? cachedClipVector(item, clip, layer)
       : null;
     const reconstructable = Boolean(
@@ -2393,7 +2596,8 @@ async function loadLayerThumbnail(item, id, size = 58) {
           .png({ compressionLevel: 7 })
           .toBuffer()
       : vector
-        ? clipVectorPng(layer, vector, thumbnailSize, thumbnailSize, true)
+        ? await clipVectorPng(layer, vector, thumbnailSize, thumbnailSize, true, thumbnailSize, thumbnailSize,
+            await clipBrushPatterns(clip, vector))
         : reconstructed
           ? await sharp(reconstructed.input)
               .trim({ background: { r: 0, g: 0, b: 0, alpha: 0 } })
@@ -3174,13 +3378,15 @@ async function clipLeafComposite(
     const vector = cachedClipVector(item, clip, layer);
     if (vector) {
       input = await clipVectorPng(
-        suppressInlineEffects ? { ...layer, edgeEffect: null, effects: [] } : layer,
+        suppressInlineEffects || layer.type === "text" && layer.textObjects?.some((object) => object.text)
+          ? { ...layer, edgeEffect: null, effects: [] } : layer,
         vector,
         width,
         height,
         false,
         clip.layerDocument.nativeWidth,
         clip.layerDocument.nativeHeight,
+        await clipBrushPatterns(clip, vector),
       );
       sourceType = "vector";
     }
@@ -3204,18 +3410,23 @@ async function clipLeafComposite(
     }).png({ compressionLevel: 1 }).toBuffer();
     sourceType = "paper";
   }
-  if (!input && layer.type === "text" && layer.textObjects?.some((object) => object.text)) {
-    input = await renderCachedClipText(clip, layer, width, height);
-    if (input) sourceType = "native-text";
-  }
-  if (!input && layer.type === "text" && layer.textObjects?.some((object) => object.text)) {
-    const textLayer = suppressInlineEffects
+  if ((!input || sourceType === "vector") && layer.type === "text" && layer.textObjects?.some((object) => object.text)) {
+    let text = await renderCachedClipText(clip, layer, width, height);
+    const textLayer = suppressInlineEffects || input
       ? { ...layer, edgeEffect: null, effects: [] }
       : layer;
-    input = await sharp(clipTextSvg(textLayer, clip.layerDocument, width, height))
-      .png({ compressionLevel: 1 })
-      .toBuffer();
-    sourceType = "text";
+    const nativeText = Boolean(text);
+    if (!text) text = await sharp(clipTextSvg(textLayer, clip.layerDocument, width, height))
+      .png({ compressionLevel: 1 }).toBuffer();
+    if (input) {
+      // A CSP balloon layer owns both its vector shapes and text objects.
+      // Effects must be applied to their combined silhouette, only once.
+      input = await sharp(input).composite([{ input: text }]).png({ compressionLevel: 1 }).toBuffer();
+      sourceType = "balloon-text";
+    } else {
+      input = text;
+      sourceType = nativeText ? "native-text" : "text";
+    }
   }
   if (
     !input &&
@@ -3227,7 +3438,7 @@ async function clipLeafComposite(
     if (input) sourceType = "thumbnail";
   }
   if (!input) return null;
-  if (["raster", "native-text"].includes(sourceType) && layer.edgeEffect && !suppressInlineEffects) {
+  if (["raster", "native-text", "balloon-text"].includes(sourceType) && layer.edgeEffect && !suppressInlineEffects) {
     input = await applyClipEdgeEffect(input, layer, width, height, clip.layerDocument);
   }
   if (

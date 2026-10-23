@@ -44,7 +44,7 @@ function pixels(width, height, color) {
   return data;
 }
 
-async function createFixture(file, emptyText = false) {
+async function createFixture(file, emptyText = false, balloon = false) {
   const SQL = await initSqlJs();
   const db = new SQL.Database();
   const chunks = [];
@@ -94,6 +94,29 @@ async function createFixture(file, emptyText = false) {
   const effect = Buffer.concat([u32(0), name("EffectEdge"), u32(1), radius, u32(0xffffffff), u32(0xffffffff), u32(0xffffffff)]);
   add(4, { LayerType: 0, TextLayerType: 0, TextLayerString: Buffer.from("Not redrawn"), TextLayerAttributes: text,
     LayerEffectAttached: 1, LayerEffectInfo: effect });
+  if (balloon) {
+    db.run("ALTER TABLE Layer ADD COLUMN VectorNormalType INTEGER");
+    db.run("ALTER TABLE Layer ADD COLUMN VectorNormalBalloonIndex INTEGER");
+    db.run("UPDATE Layer SET TextLayerType=1, VectorNormalType=1, VectorNormalBalloonIndex=8, LayerEffectInfo=NULL, LayerEffectAttached=0 WHERE MainId=4");
+    const header = Buffer.alloc(100);
+    [100, 76, 88, 88, 4, 8].forEach((value, index) => header.writeUInt32BE(value, index * 4));
+    [52, 56, 60].forEach((position) => header.writeUInt32BE(0xffffffff, position));
+    header.writeDoubleBE(1, 64); header.writeUInt32BE(0x130, 76);
+    header.writeUInt32BE(9, 80); header.writeUInt32BE(3, 84); header.writeDoubleBE(0.5, 88);
+    const points = [[1, 1], [6, 1], [6, 6], [1, 6]].map(([x, y]) => {
+      const point = Buffer.alloc(88); point.writeDoubleBE(x, 0); point.writeDoubleBE(y, 8);
+      [x - 1, y - 1, x + 1, y + 1].forEach((value, index) => point.writeInt32BE(value, 16 + index * 4));
+      point.writeFloatBE(1, 56); return point;
+    });
+    const externalId = Buffer.from(`extrnlid${"999".padStart(32, "0")}`);
+    const binary = Buffer.concat([header, ...points]);
+    const body = Buffer.concat([u64(externalId.length), externalId, u64(binary.length), binary]);
+    const chunk = Buffer.concat([Buffer.from("CHNKExta"), u64(body.length), body]);
+    db.run("INSERT INTO ExternalChunk VALUES (?, ?)", [externalId, offset]);
+    db.run("CREATE TABLE VectorObjectList (LayerId INTEGER, VectorData BLOB)");
+    db.run("INSERT INTO VectorObjectList VALUES (4, ?)", [externalId]);
+    chunks.push(chunk); offset += chunk.length;
+  }
   const preview = await sharp({ create: { width: 8, height: 8, channels: 4, background: "black" } }).png().toBuffer();
   db.run("CREATE TABLE CanvasPreview (ImageData BLOB)");
   db.run("INSERT INTO CanvasPreview VALUES (?)", [preview]);
@@ -129,6 +152,17 @@ async function run() {
     const emptyStats = await sharp(Buffer.from(emptyText.dataUrl.split(",")[1], "base64")).stats();
     assert.deepEqual(emptyStats.channels.slice(0, 3).map((channel) => [channel.min, channel.max]), [[20, 20], [40, 40], [80, 80]],
       "an empty native text cache does not trigger font reconstruction");
+    const balloonFile = path.join(directory, "balloon.clip");
+    await createFixture(balloonFile, false, true);
+    const balloonItem = { kind: "file", path: balloonFile, name: "balloon.clip" };
+    const balloonResult = await renderLayeredImage(balloonItem, { 3: true, 4: true, 5: true }, { preserveOriginal: false });
+    const balloonPixels = await sharp(Buffer.from(balloonResult.dataUrl.split(",")[1], "base64")).ensureAlpha().raw().toBuffer();
+    const balloonPixel = (x, y) => [...balloonPixels.subarray((y * 8 + x) * 4, (y * 8 + x + 1) * 4)];
+    assert.deepEqual(balloonPixel(3, 3), [255, 0, 0, 255], "text is composed over the vector shapes owned by the same layer");
+    assert(balloonPixel(4, 4).slice(0, 3).every((channel) => channel >= 240), "anti-aliased balloon fill hides the blue background");
+    assert.equal(balloonPixel(4, 4)[3], 255);
+    const balloonHidden = await renderLayeredImage(balloonItem, { 3: true, 4: false, 5: true }, { preserveOriginal: false });
+    assert.equal(balloonHidden.dataUrl, hidden.dataUrl, "hiding a compound layer hides both its shapes and its text");
     console.log("Independent CLIP renderer tests passed");
   } finally {
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));

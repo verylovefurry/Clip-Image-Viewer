@@ -85,6 +85,8 @@ async function run() {
       { MainId: 16 },
       { MainId: 17, LayerType: 1584 },
       { MainId: 18, VectorNormalType: 1, VectorNormalFillIndex: 9 },
+      { MainId: 19, TextLayerType: 1, TextLayerString: Buffer.from("Balloon text"),
+        TextLayerAttributes: textAttributes, VectorNormalType: 1, VectorNormalBalloonIndex: 11 },
     ];
     const insert = db.prepare(`INSERT INTO Layer VALUES (${columns.map(() => "?").join(", ")})`);
     try {
@@ -156,6 +158,9 @@ async function run() {
     assert.equal(byId.get("16").kind, "3d");
     assert.equal(byId.get("17").kind, "paper");
     assert.equal(byId.get("18").kind, "vector-object");
+    assert.equal(byId.get("19").kind, "balloon");
+    assert.equal(byId.get("19").vectorInfo.objectSourceId, 11);
+    assert.equal(byId.get("19").textObjectCount, 1, "balloons retain both geometry and text metadata");
     console.log("CLIP layer metadata tests passed");
   } finally {
     db.close();
