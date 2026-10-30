@@ -615,6 +615,115 @@ function attachElectronSmoke({
         }
       }
 
+      if (process.env.CLIPVIEW_SMOKE_POINTER_ZOOM === "1") {
+        const pointerZoom = await mainWindow.webContents.executeJavaScript(`(() => {
+          const stage = document.getElementById("stage");
+          const image = document.getElementById("viewerImage");
+          const close = (actual, expected, label, tolerance = 0.0001) => {
+            if (Math.abs(actual - expected) > tolerance) throw new Error(label + ": " + actual + " != " + expected);
+          };
+          const screenPoint = (x, y) => {
+            const rect = stage.getBoundingClientRect();
+            const point = new DOMMatrix(getComputedStyle(image).transform).transformPoint(new DOMPoint(x, y));
+            return { clientX: rect.left + rect.width / 2 + point.x, clientY: rect.top + rect.height / 2 + point.y };
+          };
+          const pointerAt = (x, y) => {
+            const point = screenPoint(x, y);
+            return { clientX: Math.round(point.clientX), clientY: Math.round(point.clientY) };
+          };
+          const imagePoint = (point) => {
+            const rect = stage.getBoundingClientRect();
+            return new DOMMatrix(getComputedStyle(image).transform).inverse().transformPoint(new DOMPoint(
+              point.clientX - rect.left - rect.width / 2, point.clientY - rect.top - rect.height / 2,
+            ));
+          };
+          const assertAnchor = (point, action, label) => {
+            const before = imagePoint(point);
+            action();
+            const after = screenPoint(before.x, before.y);
+            close(after.clientX, point.clientX, label + " x", 0.01);
+            close(after.clientY, point.clientY, label + " y", 0.01);
+          };
+          const wheel = (point, deltaY) => {
+            const event = new WheelEvent("wheel", { ...point, deltaY, bubbles: true, cancelable: true });
+            stage.dispatchEvent(event);
+            if (!event.defaultPrevented) throw new Error("Viewer wheel zoom was not handled");
+          };
+          let cases = 0;
+          try {
+            for (const rotation of [0, 90, 180, 270]) for (const flipX of [1, -1]) {
+              state.rotation = rotation; state.flipX = flipX;
+              fitImage();
+              state.zoom *= 0.7; state.panX = 37; state.panY = -29;
+              applyTransform();
+              const point = pointerAt(image.naturalWidth * 0.37, image.naturalHeight * 0.63);
+              const before = { zoom: state.zoom, panX: state.panX, panY: state.panY };
+              assertAnchor(point, () => wheel(point, -120), "Zoom in at cursor");
+              close(state.zoom, before.zoom * 1.12, "Wheel scale");
+              assertAnchor(point, () => wheel(point, 120), "Zoom out at cursor");
+              close(state.zoom, before.zoom, "Round-trip zoom");
+              close(state.panX, before.panX, "Round-trip pan x");
+              close(state.panY, before.panY, "Round-trip pan y");
+              if (state.fitMode) throw new Error("Manual zoom must leave fit mode");
+              cases += 1;
+            }
+            state.rotation = 0; state.flipX = 1;
+            for (const [zoom, delta, expected] of [[31.5, -120, 32], [0.0201, 120, 0.02]]) {
+              state.zoom = zoom; state.panX = 7; state.panY = -3; applyTransform();
+              const rect = stage.getBoundingClientRect();
+              const point = { clientX: Math.round(rect.left + rect.width * 0.6), clientY: Math.round(rect.top + rect.height * 0.55) };
+              assertAnchor(point, () => wheel(point, delta), "Clamped zoom");
+              close(state.zoom, expected, "Zoom limit");
+              const pan = { x: state.panX, y: state.panY };
+              assertAnchor(point, () => wheel(point, delta), "Zoom at limit");
+              close(state.panX, pan.x, "No pan at zoom limit x");
+              close(state.panY, pan.y, "No pan at zoom limit y");
+              cases += 1;
+            }
+            fitImage();
+            state.panX = 21; state.panY = -17; applyTransform();
+            const point = pointerAt(image.naturalWidth * 0.37, image.naturalHeight * 0.63);
+            stage.dispatchEvent(new MouseEvent("mouseleave"));
+            wheel(point, -120);
+            for (const key of ["+", "-"]) {
+              assertAnchor(point, () => stage.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })), "Keyboard cursor zoom");
+            }
+            const movedPoint = pointerAt(image.naturalWidth * 0.6, image.naturalHeight * 0.4);
+            stage.dispatchEvent(new MouseEvent("mousemove", { ...movedPoint, bubbles: true }));
+            assertAnchor(movedPoint, () => stage.dispatchEvent(new KeyboardEvent("keydown", { key: "+", bubbles: true, cancelable: true })), "Keyboard follows mouse movement");
+            document.getElementById("imageLayer").dispatchEvent(new MouseEvent("mousedown", { ...point, button: 0, bubbles: true }));
+            assertAnchor(point, () => wheel(point, -120), "Zoom while dragging");
+            const draggedPan = { x: state.panX, y: state.panY };
+            stage.dispatchEvent(new MouseEvent("mousemove", { clientX: point.clientX + 17, clientY: point.clientY + 11, bubbles: true }));
+            close(state.panX, draggedPan.x + 17, "Drag after zoom x");
+            close(state.panY, draggedPan.y + 11, "Drag after zoom y");
+            window.dispatchEvent(new MouseEvent("mouseup"));
+            const beforeHorizontal = state.zoom;
+            stage.dispatchEvent(new WheelEvent("wheel", { ...point, deltaX: 120, deltaY: 0, bubbles: true, cancelable: true }));
+            close(state.zoom, beforeHorizontal, "Horizontal wheel does not zoom");
+            document.getElementById("videoSeek").dispatchEvent(new WheelEvent("wheel", { ...point, deltaY: 120, bubbles: true, cancelable: true }));
+            close(state.zoom, beforeHorizontal, "Video controls do not trigger viewer zoom");
+            stage.dispatchEvent(new MouseEvent("mouseleave"));
+            const centeredPan = { x: state.panX, y: state.panY };
+            document.getElementById("zoomInBtn").click();
+            close(state.panX, centeredPan.x, "Toolbar center fallback x");
+            close(state.panY, centeredPan.y, "Toolbar center fallback y");
+            actualSize();
+            close(state.panX, 0, "Actual size resets pan x"); close(state.panY, 0, "Actual size resets pan y");
+            close(state.zoom, 1, "Actual size zoom");
+            return { transformCases: cases, keyboard: true, limits: true, dragging: true };
+          } catch (error) {
+            return { error: error.stack || error.message };
+          } finally {
+            state.rotation = 0; state.flipX = 1; state.dragging = false;
+            stage.dispatchEvent(new MouseEvent("mouseleave"));
+            fitImage();
+          }
+        })()`);
+        if (pointerZoom.error) throw new Error(pointerZoom.error);
+        console.log(`Pointer zoom smoke passed: ${JSON.stringify(pointerZoom)}`);
+      }
+
       await mainWindow.webContents.executeJavaScript(
         "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
       );

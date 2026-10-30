@@ -87,6 +87,7 @@ let thumbnailRenderSequence = 0;
 let thumbnailObserver = null;
 let thumbnailController = null;
 let layerDecodeController = null;
+let zoomPointer = null;
 const imageCache = new Map();
 const MAX_IMAGE_CACHE_BYTES = 160 * 1024 * 1024;
 const videoThumbnailCache = new Map();
@@ -1143,10 +1144,29 @@ function actualSize() {
   applyTransform();
 }
 
-function zoomBy(factor) {
+function zoomBy(factor, pointer = zoomPointer) {
   if (!hasMedia()) return;
+  const zoom = Math.min(32, Math.max(0.02, state.zoom * factor));
+  if (state.mediaType === "image" && pointer) {
+    const rect = stage.getBoundingClientRect();
+    if (pointer.clientX >= rect.left && pointer.clientX <= rect.right &&
+        pointer.clientY >= rect.top && pointer.clientY <= rect.bottom) {
+      const x = pointer.clientX - rect.left - rect.width / 2;
+      const y = pointer.clientY - rect.top - rect.height / 2;
+      const ratio = zoom / state.zoom;
+      // Pan is in screen coordinates, so this also holds after rotation/flip.
+      const panX = x - (x - state.panX) * ratio;
+      const panY = y - (y - state.panY) * ratio;
+      if (state.dragging) {
+        state.panStartX += panX - state.panX;
+        state.panStartY += panY - state.panY;
+      }
+      state.panX = panX;
+      state.panY = panY;
+    }
+  }
   state.fitMode = false;
-  state.zoom = Math.min(32, Math.max(0.02, state.zoom * factor));
+  state.zoom = zoom;
   applyTransform();
 }
 
@@ -2158,14 +2178,20 @@ function bindActions() {
 }
 
 stage.addEventListener("wheel", (event) => {
-  if (!hasMedia()) return;
+  if (!hasMedia() || !event.deltaY) return;
   if (event.target.closest(".video-controls")) return;
   event.preventDefault();
-  zoomBy(event.deltaY < 0 ? 1.12 : 1 / 1.12);
+  zoomPointer = { clientX: event.clientX, clientY: event.clientY };
+  zoomBy(event.deltaY < 0 ? 1.12 : 1 / 1.12, zoomPointer);
 }, { passive: false });
 
-stage.addEventListener("mousemove", () => {
+stage.addEventListener("mousemove", (event) => {
+  zoomPointer = { clientX: event.clientX, clientY: event.clientY };
   if (state.mediaType === "video") showVideoControls("full", 2000);
+});
+
+stage.addEventListener("mouseleave", () => {
+  zoomPointer = null;
 });
 
 stage.addEventListener("contextmenu", (event) => {

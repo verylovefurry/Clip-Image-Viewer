@@ -47,6 +47,7 @@ async function run() {
       CLIPVIEW_SMOKE_DECODER_RACE: "1",
       CLIPVIEW_SMOKE_CORRUPT_IMAGE: corruptImage,
       CLIPVIEW_SMOKE_THUMBNAIL_WINDOW: "1",
+      CLIPVIEW_SMOKE_POINTER_ZOOM: "1",
     };
     delete env.ELECTRON_RUN_AS_NODE;
     await new Promise((resolve, reject) => {
