@@ -79,6 +79,50 @@ function attachElectronSmoke({
       );
       await wait(250);
 
+      if (process.env.CLIPVIEW_SMOKE_COLOR_MANAGEMENT === "1") {
+        const input = fs.readFileSync(expectedPath);
+        const sharp = require("sharp");
+        const metadata = await sharp(input).metadata();
+        const originalUrl = `data:image/jpeg;base64,${input.toString("base64")}`;
+        let referenceUrl = originalUrl;
+        if (metadata.space === "cmyk") {
+          const reference = await sharp(input).autoOrient().withIccProfile("srgb")
+            .png({ compressionLevel: 1 }).toBuffer();
+          referenceUrl = `data:image/png;base64,${reference.toString("base64")}`;
+        }
+        const colors = await mainWindow.webContents.executeJavaScript(`(async () => {
+          const sample = (image) => {
+            const canvas = document.createElement("canvas");
+            canvas.width = 64; canvas.height = 64;
+            const context = canvas.getContext("2d");
+            context.drawImage(image, 0, 0, 64, 64);
+            return context.getImageData(0, 0, 64, 64).data;
+          };
+          const decode = async (url) => {
+            const image = new Image(); image.src = url; await image.decode();
+            return sample(image);
+          };
+          const expected = await decode(${JSON.stringify(referenceUrl)});
+          const compare = (actual) => {
+            let maximum = 0; let sum = 0;
+            for (let index = 0; index < expected.length; index += 1) {
+              if (index % 4 === 3) continue;
+              const error = Math.abs(actual[index] - expected[index]);
+              maximum = Math.max(maximum, error); sum += error;
+            }
+            return { maximum, mean: sum / (64 * 64 * 3) };
+          };
+          return {
+            displayed: compare(sample(document.getElementById("viewerImage"))),
+            nativeJpeg: compare(await decode(${JSON.stringify(originalUrl)})),
+          };
+        })()`);
+        if (colors.displayed.maximum > 1) {
+          throw new Error(`Displayed colors differ from the ICC conversion: ${JSON.stringify(colors)}`);
+        }
+        console.log(`ICC color smoke passed: ${JSON.stringify(colors)}`);
+      }
+
       if (process.env.CLIPVIEW_SMOKE_VIDEO_SHORTCUT === "1") {
         const beforeTitle = title;
         mainWindow.webContents.sendInputEvent({ type: "keyDown", keyCode: "SPACE" });

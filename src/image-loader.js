@@ -3898,25 +3898,41 @@ async function loadImage(item, cropMode = "full") {
   ) {
     throw new Error("이미지 크기가 안전 제한을 초과합니다.");
   }
+  let metadata = originalMetadata;
+  if (originalMetadata.space === "cmyk") {
+    // Chromium's CMYK JPEG decoding can differ from the ICC-managed thumbnail path.
+    const converted = await sharp(buffer, { page: 0 })
+      .autoOrient()
+      .withIccProfile("srgb")
+      .png({ compressionLevel: 1 })
+      .toBuffer({ resolveWithObject: true });
+    buffer = converted.data;
+    mime = "image/png";
+    source = `${source} · CMYK → sRGB`;
+    metadata = {
+      ...originalMetadata,
+      width: converted.info.width,
+      height: converted.info.height,
+      pageHeight: converted.info.height,
+    };
+  }
   const cropRegion = calculateCropRegion(
     sourceData.crop,
-    originalMetadata.width,
-    originalMetadata.height,
+    metadata.width,
+    metadata.height,
     cropMode,
   );
   if (cropRegion) {
     buffer = await sharp(buffer, { page: 0 }).extract(cropRegion).png().toBuffer();
     mime = "image/png";
     source = `${source} · ${cropMode === "trim" ? "재단선" : "재단 여백"}`;
+    metadata = {
+      ...metadata,
+      width: cropRegion.width,
+      height: cropRegion.height,
+      format: "PNG",
+    };
   }
-  const metadata = cropRegion
-    ? {
-        ...originalMetadata,
-        width: cropRegion.width,
-        height: cropRegion.height,
-        format: "PNG",
-      }
-    : originalMetadata;
   let stat = null;
   const diskPath = item.kind === "archive-entry" ? item.archivePath : item.path;
   try {
@@ -3963,7 +3979,9 @@ async function loadThumbnail(item, width = 180, height = 110) {
     input = (await sourceBuffer(item)).buffer;
   }
   const thumbnail = await sharp(input, { page: 0 })
+    .autoOrient()
     .resize(width, height, { fit: "inside", withoutEnlargement: true })
+    .withIccProfile("srgb")
     .png({ compressionLevel: 1 })
     .toBuffer();
   const dataUrl = `data:image/png;base64,${thumbnail.toString("base64")}`;

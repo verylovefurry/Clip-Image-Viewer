@@ -32,6 +32,7 @@ async function run() {
           children: [{ name: "Sample layer", left: 0, top: 0, imageData }],
         }));
       } else {
+        if (ext === "jpeg" && index === 1) pixels.withIccProfile("cmyk");
         await pixels.toFormat(ext).toFile(output);
       }
     }
@@ -48,11 +49,12 @@ async function run() {
       CLIPVIEW_SMOKE_CORRUPT_IMAGE: corruptImage,
       CLIPVIEW_SMOKE_THUMBNAIL_WINDOW: "1",
       CLIPVIEW_SMOKE_POINTER_ZOOM: "1",
+      CLIPVIEW_SMOKE_COLOR_MANAGEMENT: "1",
     };
     delete env.ELECTRON_RUN_AS_NODE;
     await new Promise((resolve, reject) => {
       const child = spawn(require("electron"), [
-        ".", path.join(media, "page000.png"), "--smoke-test",
+        ".", path.join(media, "page001.jpeg"), "--smoke-test",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
