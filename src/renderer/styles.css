@@ -31,6 +31,12 @@ kbd { font: 11px "Segoe UI", "Malgun Gothic", sans-serif; color: var(--muted); }
 hr { height: 1px; border: 0; background: var(--line); }
 .icon-button { min-width: 30px; padding: 3px 8px; }
 .hidden { display: none !important; }
+.audio-presentation { position: absolute; inset: 0 32px 100px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; text-align: center; pointer-events: none; }
+.audio-presentation span { color: var(--muted); font-size: 12px; }
+.audio-presentation strong { max-width: 100%; overflow-wrap: anywhere; font-size: 18px; font-weight: 600; }
+.audio-active #viewerVideo { visibility: hidden; }
+.image-layer.audio-active { background: var(--bg); }
+.audio-active #videoSubtitleBtn, .audio-active #videoFullscreenBtn { display: none; }
 
 /* File commands and viewing commands have separate, compact toolbars. */
 .topbar {

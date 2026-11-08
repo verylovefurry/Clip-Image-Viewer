@@ -79,6 +79,57 @@ function attachElectronSmoke({
       );
       await wait(250);
 
+      if (process.env.CLIPVIEW_SMOKE_AUDIO === "1") {
+        const result = await mainWindow.webContents.executeJavaScript(`(async () => {
+          const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          const indices = state.items.map((item, index) => item.mediaType === "audio" ? index : -1).filter(index => index >= 0);
+          const formats = [];
+          for (const index of indices) {
+            await selectItem(index, { immediate: true });
+            for (let attempt = 0; attempt < 100 && (video.readyState < 2 || video.paused); attempt += 1) await delay(50);
+            assert(state.mediaType === "audio" && video.readyState >= 2 && !video.paused, "Audio did not autoplay: " + currentItem().name);
+            assert(video.duration > 0 && state.metadata.width === 0, "Invalid audio metadata");
+            assert(!document.getElementById("audioPresentation").classList.contains("hidden"), "Audio title missing");
+            showVideoControls("volume", 1200, { lockMode: true }); hideVideoControls();
+            assert(state.videoControlsMode === "full" && videoControlsVisible(), "Audio controls must stay visible");
+            formats.push(currentItem().name.split(".").pop());
+          }
+          openSettings();
+          const setting = document.getElementById("wheelActionSelect");
+          setting.value = "navigate"; setting.dispatchEvent(new Event("change"));
+          document.getElementById("settingsDialog").close();
+          assert(localStorage.getItem("wheelAction") === "navigate", "Wheel preference not saved");
+          const before = state.index;
+          const zoom = state.zoom;
+          stage.dispatchEvent(new WheelEvent("wheel", { deltaY: -120, bubbles: true, cancelable: true }));
+          for (let attempt = 0; attempt < 100 && loading.classList.contains("hidden") === false; attempt += 1) await delay(50);
+          assert(state.index === (before - 1 + state.items.length) % state.items.length, "Wheel did not navigate backwards");
+          assert(state.zoom === zoom, "Navigation wheel changed zoom");
+          openSettings(); assert(setting.value === "navigate", "Settings did not restore wheel choice");
+          setting.value = "zoom"; setting.dispatchEvent(new Event("change"));
+          document.getElementById("settingsDialog").close();
+          changeVideoVolume(-0.1);
+          setVideoPlaybackMode("repeatAll");
+          assert(indices.includes(nextVideoIndexForMode()), "Repeat-all must stay in the audio list");
+          setVideoPlaybackMode("shuffle");
+          assert(indices.includes(nextVideoIndexForMode()), "Shuffle must stay in the audio list");
+          setVideoPlaybackMode("repeatOne");
+          handleVideoEnded();
+          assert(video.currentTime < 0.1, "Repeat-one must restart playback");
+          setVideoPlaybackMode("sequential");
+          video.currentTime = 1;
+          seekVideoBy(1);
+          assert(Math.abs(video.currentTime - 2) < 0.1, "Audio seek did not update position");
+          toggleThumbnails(true); await delay(250);
+          assert([...document.querySelectorAll(".thumb-item img")].some(image => image.naturalWidth), "Audio thumbnail missing");
+          toggleThumbnails(false);
+          return { formats, wheelNavigation: true, settingsPersistence: true };
+        })()`);
+        title = await mainWindow.webContents.executeJavaScript("document.title");
+        console.log("Audio smoke passed: " + JSON.stringify(result));
+      }
+
       if (process.env.CLIPVIEW_SMOKE_COLOR_MANAGEMENT === "1") {
         const input = fs.readFileSync(expectedPath);
         const sharp = require("sharp");
@@ -121,6 +172,34 @@ function attachElectronSmoke({
           throw new Error(`Displayed colors differ from the ICC conversion: ${JSON.stringify(colors)}`);
         }
         console.log(`ICC color smoke passed: ${JSON.stringify(colors)}`);
+      }
+
+      if (process.env.CLIPVIEW_SMOKE_WHEEL === "1") {
+        const wheel = await mainWindow.webContents.executeJavaScript(`(async () => {
+          const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const start = state.index;
+          openSettings();
+          const setting = document.getElementById("wheelActionSelect");
+          setting.value = "navigate"; setting.dispatchEvent(new Event("change"));
+          document.getElementById("settingsDialog").close();
+          for (const direction of [1, -1]) {
+            const expected = (state.index + direction + state.items.length) % state.items.length;
+            stage.dispatchEvent(new WheelEvent("wheel", { deltaY: direction * 120, bubbles: true, cancelable: true }));
+            let ready = false;
+            for (let attempt = 0; attempt < 150; attempt += 1) {
+              await delay(50);
+              ready = state.index === expected && !imageLayer.classList.contains("hidden") && loading.classList.contains("hidden") && image.naturalWidth > 0 && image.alt === currentItem().name;
+              if (ready) break;
+            }
+            if (!ready) throw new Error("Wheel navigation did not show the selected image");
+          }
+          if (state.index !== start) throw new Error("Wheel round trip changed selection");
+          openSettings();
+          setting.value = "zoom"; setting.dispatchEvent(new Event("change"));
+          document.getElementById("settingsDialog").close();
+          return { forward: true, backward: true };
+        })()`);
+        console.log("Image wheel navigation smoke passed: " + JSON.stringify(wheel));
       }
 
       if (process.env.CLIPVIEW_SMOKE_VIDEO_SHORTCUT === "1") {
@@ -863,6 +942,10 @@ function attachElectronSmoke({
         fs.writeFileSync(screenshotPath, image.toPNG());
       }
       const bounds = mainWindow.getBounds();
+      if (process.env.CLIPVIEW_SMOKE_SETTINGS_SCREENSHOT) {
+        await mainWindow.webContents.executeJavaScript("openSettings()");
+        fs.writeFileSync(process.env.CLIPVIEW_SMOKE_SETTINGS_SCREENSHOT, (await mainWindow.webContents.capturePage()).toPNG());
+      }
       if (!smokeUseWindowState && Math.abs(bounds.width / bounds.height - 3 / 4) > 0.002) {
         throw new Error(`Initial window is not 3:4: ${JSON.stringify(bounds)}`);
       }

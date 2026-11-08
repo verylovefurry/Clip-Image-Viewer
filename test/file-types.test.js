@@ -4,6 +4,11 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const {
+  AUDIO_EXTENSIONS,
+  AUDIO_MIME_TYPES,
+  OPTIONAL_AUDIO_ASSOCIATION_EXTENSIONS,
+  mediaTypeForPath,
+  listFolder,
   BASIC_ASSOCIATION_EXTENSIONS,
   OPTIONAL_IMAGE_ASSOCIATION_EXTENSIONS,
   OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS,
@@ -39,3 +44,11 @@ for (const extension of VIDEO_EXTENSIONS) {
 }
 
 console.log("file type tests passed");
+for (const ext of AUDIO_EXTENSIONS) {
+  assert(AUDIO_MIME_TYPES[ext]);
+  assert(OPTIONAL_AUDIO_ASSOCIATION_EXTENSIONS.includes(ext));
+  assert(!OPTIONAL_IMAGE_ASSOCIATION_EXTENSIONS.includes(ext));
+  assert(!OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS.includes(ext));
+  assert.equal(mediaTypeForPath(`track${ext.toUpperCase()}`), "audio");
+  assert.equal(listFolder(".", [{ name: `track${ext}`, isFile: () => true }])[0].mediaType, "audio");
+}

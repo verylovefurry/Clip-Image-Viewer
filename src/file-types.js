@@ -35,7 +35,7 @@ const PROJECT_EXTENSIONS = new Set([".cmc"]);
 const VIDEO_EXTENSIONS = new Set([
   ".mp4", ".m4v", ".mov", ".qt", ".webm", ".mkv",
   ".avi", ".wmv", ".asf", ".flv", ".f4v",
-  ".ogv", ".ogg", ".ogm",
+  ".ogv", ".ogm",
   ".3gp", ".3g2",
   ".mpg", ".mpeg", ".mpe", ".m1v", ".m2v",
   ".ts", ".mts", ".m2ts", ".vob",
@@ -79,6 +79,14 @@ const VIDEO_MIME_TYPES = {
 const BASIC_ASSOCIATION_EXTENSIONS = new Set([
   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
 ]);
+const AUDIO_MIME_TYPES = {
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav", ".wave": "audio/wav",
+  ".flac": "audio/flac", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+  ".opus": "audio/ogg", ".m4a": "audio/mp4", ".m4b": "audio/mp4",
+  ".aac": "audio/aac", ".weba": "audio/webm",
+};
+const AUDIO_EXTENSIONS = new Set(Object.keys(AUDIO_MIME_TYPES));
 const IMAGE_EXTENSIONS = new Set([
   ...DIRECT_EXTENSIONS,
   ...CONVERT_EXTENSIONS,
@@ -92,6 +100,7 @@ const IMAGE_EXTENSIONS = new Set([
 const BROWSABLE_EXTENSIONS = new Set([
   ...IMAGE_EXTENSIONS,
   ...VIDEO_EXTENSIONS,
+  ...AUDIO_EXTENSIONS,
   ...ARCHIVE_EXTENSIONS,
 ]);
 const SUPPORTED_EXTENSIONS = new Set([...BROWSABLE_EXTENSIONS, ...PROJECT_EXTENSIONS]);
@@ -103,9 +112,11 @@ const OPTIONAL_IMAGE_ASSOCIATION_EXTENSIONS = [
   .filter((ext) => !BASIC_ASSOCIATION_EXTENSIONS.has(ext))
   .sort();
 const OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS = [...VIDEO_EXTENSIONS].sort();
+const OPTIONAL_AUDIO_ASSOCIATION_EXTENSIONS = [...AUDIO_EXTENSIONS].sort();
 const OPTIONAL_ASSOCIATION_EXTENSIONS = [
   ...OPTIONAL_IMAGE_ASSOCIATION_EXTENSIONS,
   ...OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS,
+  ...OPTIONAL_AUDIO_ASSOCIATION_EXTENSIONS,
 ].sort();
 
 function extensionOf(filePath) {
@@ -125,6 +136,7 @@ function isVideo(filePath) {
 }
 
 function mediaTypeForPath(filePath) {
+  if (AUDIO_EXTENSIONS.has(extensionOf(filePath))) return "audio";
   if (isVideo(filePath)) return "video";
   if (isImage(filePath)) return "image";
   return "other";
@@ -157,6 +169,9 @@ function findComicProject(folderPath, entries = fs.readdirSync(folderPath, { wit
 }
 
 module.exports = {
+  AUDIO_EXTENSIONS,
+  AUDIO_MIME_TYPES,
+  OPTIONAL_AUDIO_ASSOCIATION_EXTENSIONS,
   ARCHIVE_EXTENSIONS,
   BASIC_ASSOCIATION_EXTENSIONS,
   BPG_EXTENSIONS,

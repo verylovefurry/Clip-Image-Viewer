@@ -49,6 +49,7 @@ async function run() {
       CLIPVIEW_SMOKE_CORRUPT_IMAGE: corruptImage,
       CLIPVIEW_SMOKE_THUMBNAIL_WINDOW: "1",
       CLIPVIEW_SMOKE_POINTER_ZOOM: "1",
+      CLIPVIEW_SMOKE_WHEEL: "1",
       CLIPVIEW_SMOKE_COLOR_MANAGEMENT: "1",
     };
     delete env.ELECTRON_RUN_AS_NODE;

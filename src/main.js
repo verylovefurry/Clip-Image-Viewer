@@ -17,6 +17,8 @@ const { execFileSync, spawn } = require("child_process");
 const { pathToFileURL } = require("url");
 const {
   ARCHIVE_EXTENSIONS,
+  AUDIO_MIME_TYPES,
+  OPTIONAL_AUDIO_ASSOCIATION_EXTENSIONS,
   BASIC_ASSOCIATION_EXTENSIONS,
   OPTIONAL_ASSOCIATION_EXTENSIONS,
   OPTIONAL_IMAGE_ASSOCIATION_EXTENSIONS,
@@ -36,7 +38,8 @@ const { constrainBounds, createDefaultBounds } = require("./window-state");
 const ALL_EXTENSIONS = [...SUPPORTED_EXTENSIONS].sort();
 const OPTIONAL_ASSOCIATION_COUNT = (
   OPTIONAL_IMAGE_ASSOCIATION_EXTENSIONS.length +
-  OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS.length
+  OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS.length +
+  OPTIONAL_AUDIO_ASSOCIATION_EXTENSIONS.length
 );
 const SUBTITLE_EXTENSIONS = new Set([".vtt", ".srt", ".ass", ".ssa"]);
 const MAX_SUBTITLE_BYTES = 20 * 1024 * 1024;
@@ -1078,18 +1081,19 @@ ipcMain.handle("media-file-url", async (_event, item) => {
   if (!item || item.kind !== "file" || !item.path) {
     throw new Error("동영상 파일을 열 수 없습니다.");
   }
-  if (mediaTypeForPath(item.path) !== "video") {
-    throw new Error("동영상 파일이 아닙니다.");
+  const mediaType = mediaTypeForPath(item.path);
+  if (!["video", "audio"].includes(mediaType)) {
+    throw new Error("동영상 또는 오디오 파일이 아닙니다.");
   }
   const stat = await fs.promises.stat(item.path);
   return {
     url: pathToFileURL(item.path).toString(),
-    mime: VIDEO_MIME_TYPES[extensionOf(item.path)] || "",
+    mime: AUDIO_MIME_TYPES[extensionOf(item.path)] || VIDEO_MIME_TYPES[extensionOf(item.path)] || "",
     metadata: {
       format: extensionOf(item.path).slice(1).toUpperCase(),
       byteSize: stat.size,
       modifiedAt: stat.mtimeMs,
-      source: "동영상 파일",
+      source: mediaType === "audio" ? "오디오 파일" : "동영상 파일",
     },
   };
 });
@@ -1155,6 +1159,7 @@ ipcMain.handle("get-runtime-info", () => ({
   basicAssociations: [...BASIC_ASSOCIATION_EXTENSIONS].sort(),
   optionalImageAssociations: OPTIONAL_IMAGE_ASSOCIATION_EXTENSIONS,
   optionalVideoAssociations: OPTIONAL_VIDEO_ASSOCIATION_EXTENSIONS,
+  optionalAudioAssociations: OPTIONAL_AUDIO_ASSOCIATION_EXTENSIONS,
   optionalAssociations: OPTIONAL_ASSOCIATION_EXTENSIONS,
   associationsEnabled: readAssociationPreference(),
   updateSupported: updateSupported(),

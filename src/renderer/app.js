@@ -49,6 +49,7 @@ const state = {
   videoControlsLockedMode: "",
   videoPlaybackMode: localStorage.getItem("videoPlaybackMode") || "sequential",
   settings: {
+    wheelAction: localStorage.getItem("wheelAction") === "navigate" ? "navigate" : "zoom",
     background: localStorage.getItem("background") || "dark",
     slideInterval: Number(localStorage.getItem("slideInterval") || 3000),
     loop: localStorage.getItem("loop") !== "false",
@@ -99,12 +100,16 @@ function currentItem() {
 const VIDEO_PLAYBACK_MODES = {
   sequential: "순서",
   repeatAll: "전체반복",
-  repeatOne: "한 영상 반복",
+  repeatOne: "한 파일 반복",
   shuffle: "무작위",
 };
 
-function isVideoItem(item = currentItem()) {
-  return item?.mediaType === "video";
+function isPlaybackItem(item = currentItem()) {
+  return ["video", "audio"].includes(item?.mediaType);
+}
+
+function isPlayback() {
+  return ["video", "audio"].includes(state.mediaType);
 }
 
 function hasMedia() {
@@ -136,7 +141,8 @@ function clearVideo() {
   videoControls.classList.remove("controls-hidden", "peek-progress", "peek-volume");
   state.videoControlsLockedMode = "";
   document.body.classList.remove("video-cursor-hidden");
-  imageLayer.classList.remove("video-active");
+  imageLayer.classList.remove("video-active", "audio-active");
+  $("audioPresentation").classList.add("hidden");
   hideVideoContextMenu();
   updateVideoUi();
 }
@@ -669,7 +675,8 @@ function setVideoControlsMode(mode) {
 }
 
 function hideVideoControls() {
-  if (state.mediaType !== "video") return;
+  if (state.mediaType === "audio") return;
+  if (!isPlayback()) return;
   if (videoControlInteracting) {
     clearTimeout(state.videoControlsTimer);
     state.videoControlsTimer = setTimeout(hideVideoControls, 500);
@@ -689,7 +696,13 @@ function videoControlsVisible() {
 }
 
 function showVideoControls(mode = "full", timeout = 2000, options = {}) {
-  if (state.mediaType !== "video") return;
+  if (!isPlayback()) return;
+  if (state.mediaType === "audio") {
+    mode = "full";
+    timeout = 0;
+    options = { forceFull: true };
+    state.videoControlsLockedMode = "";
+  }
   clearTimeout(state.videoControlsTimer);
   const locked = state.videoControlsLockedMode;
   const effectiveMode = (
@@ -721,7 +734,7 @@ function showVideoInputFeedback(mode, timeout = 1400) {
 }
 
 function showVideoContextMenu(event) {
-  if (state.mediaType !== "video") return;
+  if (!isPlayback()) return;
   event.preventDefault();
   showVideoControls("full", 4000, { forceFull: true });
   videoContextMenu.classList.remove("hidden");
@@ -851,7 +864,7 @@ function loadImageCached(index, prefetch = false) {
   if (existing?.result?.element.naturalWidth) return Promise.resolve(existing.result);
   if (existing && prefetch) return existing.promise;
   const item = state.items[index];
-  if (isVideoItem(item)) return Promise.reject(new Error("이미지 파일이 아닙니다."));
+  if (isPlaybackItem(item)) return Promise.reject(new Error("이미지 파일이 아닙니다."));
   releaseImageEntry(key);
   const entry = { result: null, promise: null, controller: new AbortController(), bytes: 0 };
   // Reissue a pending prefetch as foreground work; the worker deduplicates and promotes it.
@@ -885,7 +898,7 @@ function preloadAdjacentImages() {
   const current = imageCache.get(imageKey(state.index));
   if (current?.bytes > MAX_IMAGE_CACHE_BYTES / 2) return;
   for (const index of adjacentIndices()) {
-    if (isVideoItem(state.items[index])) continue;
+    if (isPlaybackItem(state.items[index])) continue;
     void loadImageCached(index, true).catch(() => {});
   }
 }
@@ -947,6 +960,9 @@ function updateRangeProgress(input, percent) {
 }
 
 function updateVideoUi() {
+  for (const action of ["subtitles", "fit", "actual"]) {
+    videoContextMenu.querySelector(`[data-video-action='${action}']`).classList.toggle("hidden", state.mediaType === "audio");
+  }
   const duration = Number.isFinite(video.duration) ? video.duration : 0;
   const current = Number.isFinite(video.currentTime) ? video.currentTime : 0;
   const progress = duration ? current / duration * 100 : 0;
@@ -1003,7 +1019,7 @@ function cycleVideoPlaybackMode() {
 
 function videoItemIndices() {
   return state.items
-    .map((item, index) => (isVideoItem(item) ? index : -1))
+    .map((item, index) => (item.mediaType === state.mediaType ? index : -1))
     .filter((index) => index >= 0);
 }
 
@@ -1029,7 +1045,7 @@ async function playVideoIndex(index) {
 }
 
 function handleVideoEnded() {
-  if (state.mediaType !== "video") return;
+  if (!isPlayback()) return;
   if (state.videoPlaybackMode === "repeatOne") {
     video.currentTime = 0;
     void video.play().catch(() => {});
@@ -1108,7 +1124,7 @@ function applyTransform() {
     "translate(-50%, -50%)",
   ].join(" ");
   image.style.transform = state.mediaType === "image" ? transform : "";
-  video.style.transform = state.mediaType === "video" ? transform : "";
+  video.style.transform = isPlayback() ? transform : "";
   $("zoomLabel").textContent = `${Math.round(state.zoom * 100)}%`;
   for (const [id, active] of [["fitBtn", state.fitMode], ["actualBtn", !state.fitMode && state.zoom === 1]]) {
     $(id).classList.toggle("active", active && hasMedia());
@@ -1145,6 +1161,7 @@ function actualSize() {
 }
 
 function zoomBy(factor, pointer = zoomPointer) {
+  if (state.mediaType === "audio") return;
   if (!hasMedia()) return;
   const zoom = Math.min(32, Math.max(0.02, state.zoom * factor));
   if (state.mediaType === "image" && pointer) {
@@ -1180,7 +1197,7 @@ function rotate(amount) {
 function updateInfoPanel() {
   const item = currentItem();
   const meta = state.metadata || {};
-  const values = state.mediaType === "video" ? [
+  const values = isPlayback() ? [
     ["파일", item?.name || "-"],
     ["경로", item?.displayPath || item?.path || "-"],
     ["크기", `${meta.width || 0} × ${meta.height || 0}`],
@@ -1204,7 +1221,7 @@ function updateInfoPanel() {
     ["불러오기", meta.source || "-"],
     ["수정 시각", meta.modifiedAt ? new Date(meta.modifiedAt).toLocaleString() : "-"],
   ];
-  $("infoList").innerHTML = values
+  $("infoList").innerHTML = values.filter(([key]) => state.mediaType !== "audio" || !["크기", "자막"].includes(key))
     .map(([key, value]) => `<dt>${key}</dt><dd>${escapeHtml(String(value))}</dd>`)
     .join("");
 }
@@ -1226,7 +1243,7 @@ function updateUi() {
   $("fileTitle").title = item?.displayPath || item?.path || "";
   document.title = item ? `${item.name} - Clip Image Viewer` : "Clip Image Viewer";
   $("counter").textContent = state.items.length ? `${state.index + 1} / ${state.items.length}` : "0 / 0";
-  $("dimensionLabel").textContent = state.metadata?.width
+  $("dimensionLabel").textContent = state.mediaType === "audio" ? `${state.metadata?.format || ""} · ${formatDuration(state.metadata?.duration)}` : state.metadata?.width
     ? `${state.metadata.width} × ${state.metadata.height} · ${state.metadata.format}`
     : "-";
   $("prevOverlay").classList.toggle("hidden", state.items.length < 2);
@@ -1237,14 +1254,14 @@ function updateUi() {
     (!state.settings.loop && state.index === state.items.length - 1);
   $("thumbBtn").disabled = !state.items.length;
   $("infoBtn").disabled = !state.items.length;
-  const showCropModes = !isVideoItem(item) && Boolean(state.comic?.cropAvailable);
+  const showCropModes = !isPlaybackItem(item) && Boolean(state.comic?.cropAvailable);
   $("cropModeSelect").classList.toggle("hidden", !showCropModes);
   $("cropModeSelect").value = state.cropMode;
   $("copyImageBtn").disabled = $("saveImageBtn").disabled = !state.imageDataUrl || !ready;
   for (const id of ["zoomOutBtn", "zoomInBtn", "fitBtn", "actualBtn", "rotateLeftBtn", "rotateRightBtn", "flipBtn", "slideshowBtn"]) {
-    $(id).disabled = !ready;
+    $(id).disabled = !ready || state.mediaType === "audio";
   }
-  $("slideshowBtn").disabled = !ready && !state.slideshowTimer;
+  $("slideshowBtn").disabled = (!ready || isPlayback()) && !state.slideshowTimer;
   if (state.infoVisible) updateInfoPanel();
 
   const strip = $("thumbnailStrip");
@@ -1286,7 +1303,7 @@ async function loadCurrent() {
   updateUi();
   void window.clipView.setActiveItem(item).catch(() => {});
   pruneImageCache();
-  if (isVideoItem(item)) {
+  if (isPlaybackItem(item)) {
     await loadCurrentVideo(item);
     return;
   }
@@ -1347,7 +1364,7 @@ async function loadCurrentVideo(item) {
   emptyState.classList.add("hidden");
   clearImage();
   clearVideo();
-  state.mediaType = "video";
+  state.mediaType = item.mediaType;
   imageLayer.classList.add("hidden");
 
   try {
@@ -1378,8 +1395,8 @@ async function loadCurrentVideo(item) {
         cleanup();
         reject(new Error(
           browserSupport
-            ? "동영상 파일 또는 코덱을 재생할 수 없습니다."
-            : "Electron이 이 동영상 컨테이너 또는 코덱을 지원하지 않습니다.",
+            ? "미디어 파일 또는 코덱을 재생할 수 없습니다."
+            : "Electron이 이 미디어 컨테이너 또는 코덱을 지원하지 않습니다.",
         ));
       };
       cancelPendingVideoLoad = () => {
@@ -1395,8 +1412,8 @@ async function loadCurrentVideo(item) {
     if (sequence !== loadSequence) return;
 
     state.videoSrc = media.url;
-    state.naturalWidth = video.videoWidth || 16;
-    state.naturalHeight = video.videoHeight || 9;
+    state.naturalWidth = state.mediaType === "audio" ? 0 : (video.videoWidth || 16);
+    state.naturalHeight = state.mediaType === "audio" ? 0 : (video.videoHeight || 9);
     video.setAttribute("width", String(state.naturalWidth));
     video.setAttribute("height", String(state.naturalHeight));
     state.metadata = {
@@ -1411,14 +1428,18 @@ async function loadCurrentVideo(item) {
     video.classList.remove("hidden");
     imageLayer.classList.remove("hidden");
     imageLayer.classList.add("video-active");
+    imageLayer.classList.toggle("audio-active", state.mediaType === "audio");
+    $("audioPresentation").classList.toggle("hidden", state.mediaType !== "audio");
+    $("audioFileName").textContent = item.name;
+    $("audioFormat").textContent = state.metadata.format;
     fitImage();
     updateVideoUi();
     showVideoControls("full", 2000);
     updateUi();
     preloadAdjacentImages();
     void video.play().catch((error) => {
-      if (sequence !== loadSequence || state.mediaType !== "video") return;
-      showToast(error?.message || "동영상을 자동 재생하지 못했습니다.", true);
+      if (sequence !== loadSequence || !isPlayback()) return;
+      showToast(error?.message || "미디어를 자동 재생하지 못했습니다.", true);
       updateVideoUi();
     });
   } catch (error) {
@@ -1521,6 +1542,10 @@ function toggleThumbnails(force) {
 }
 
 function videoPlaceholderDataUrl(item) {
+  if (item.mediaType === "audio") {
+    const format = escapeHtml(item.name.split(".").pop().toUpperCase());
+    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="180" height="110"><rect width="180" height="110" fill="#242727"/><text x="90" y="62" text-anchor="middle" fill="#ced8d1" font-family="Segoe UI,sans-serif" font-size="18">${format}</text></svg>`)}`;
+  }
   const label = escapeHtml((item.name || "VIDEO").replace(/^(.{22}).+$/, "$1..."));
   const svg = `
     <svg xmlns="http://www.w3.org/2000/svg" width="300" height="152" viewBox="0 0 300 152">
@@ -1687,7 +1712,7 @@ function renderThumbnails() {
       running += 1;
       void (async () => {
         try {
-          const source = isVideoItem(item)
+          const source = item.mediaType === "audio" ? videoPlaceholderDataUrl(item) : isPlaybackItem(item)
             ? await loadVideoThumbnailCached(item, controller.signal)
               .catch(() => videoPlaceholderDataUrl(item))
             : await window.clipView.loadThumbnail(item);
@@ -1759,7 +1784,7 @@ function transformedPngDataUrl() {
 }
 
 function toggleVideoPlayback() {
-  if (state.mediaType !== "video") return;
+  if (!isPlayback()) return;
   if (video.paused) {
     void video.play().catch((error) => {
       showToast(error?.message || "동영상을 재생하지 못했습니다.", true);
@@ -1771,14 +1796,14 @@ function toggleVideoPlayback() {
 }
 
 function seekVideoBy(seconds) {
-  if (state.mediaType !== "video" || !Number.isFinite(video.duration)) return;
+  if (!isPlayback() || !Number.isFinite(video.duration)) return;
   video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + seconds));
   updateVideoUi();
   showVideoControls("progress", 1200, { lockMode: true });
 }
 
 function changeVideoVolume(delta) {
-  if (state.mediaType !== "video") return;
+  if (!isPlayback()) return;
   video.muted = false;
   video.volume = Math.max(0, Math.min(1, video.volume + delta));
   updateVideoUi();
@@ -1786,7 +1811,7 @@ function changeVideoVolume(delta) {
 }
 
 function handleVideoShortcut(event, key) {
-  if (state.mediaType !== "video" || event.altKey || event.metaKey || event.shiftKey) {
+  if (!isPlayback() || event.altKey || event.metaKey || event.shiftKey) {
     return false;
   }
   if (key === " ") {
@@ -1856,6 +1881,7 @@ function renderAssociationOptions() {
   $("videoAssociationOptions").innerHTML = renderList(
     state.runtime.optionalVideoAssociations || [],
   );
+  $("audioAssociationOptions").innerHTML = renderList(state.runtime.optionalAudioAssociations || []);
 }
 
 async function initializeRuntimeInfo() {
@@ -1919,6 +1945,7 @@ function applyUpdateState(update) {
 }
 
 function openSettings() {
+  $("wheelActionSelect").value = state.settings.wheelAction;
   $("backgroundSelect").value = state.settings.background;
   $("slideIntervalSelect").value = String(state.settings.slideInterval);
   $("loopCheckbox").checked = state.settings.loop;
@@ -2020,7 +2047,7 @@ function bindActions() {
     showVideoInputFeedback("volume");
   };
   videoSeek.oninput = (event) => {
-    if (state.mediaType !== "video" || !Number.isFinite(video.duration)) return;
+    if (!isPlayback() || !Number.isFinite(video.duration)) return;
     video.currentTime = Number(event.target.value) / 1000 * video.duration;
     updateVideoUi();
     showVideoInputFeedback("progress");
@@ -2073,6 +2100,10 @@ function bindActions() {
     state.settings.background = event.target.value;
     localStorage.setItem("background", state.settings.background);
     applyBackground(state.settings.background);
+  };
+  $("wheelActionSelect").onchange = (event) => {
+    state.settings.wheelAction = event.target.value === "navigate" ? "navigate" : "zoom";
+    localStorage.setItem("wheelAction", state.settings.wheelAction);
   };
   $("slideIntervalSelect").onchange = (event) => {
     state.settings.slideInterval = Number(event.target.value);
@@ -2181,13 +2212,18 @@ stage.addEventListener("wheel", (event) => {
   if (!hasMedia() || !event.deltaY) return;
   if (event.target.closest(".video-controls")) return;
   event.preventDefault();
+  if (state.settings.wheelAction === "navigate") {
+    moveTo(event.deltaY > 0 ? 1 : -1);
+    return;
+  }
+  if (state.mediaType === "audio") return;
   zoomPointer = { clientX: event.clientX, clientY: event.clientY };
   zoomBy(event.deltaY < 0 ? 1.12 : 1 / 1.12, zoomPointer);
 }, { passive: false });
 
 stage.addEventListener("mousemove", (event) => {
   zoomPointer = { clientX: event.clientX, clientY: event.clientY };
-  if (state.mediaType === "video") showVideoControls("full", 2000);
+  if (isPlayback()) showVideoControls("full", 2000);
 });
 
 stage.addEventListener("mouseleave", () => {
@@ -2195,15 +2231,16 @@ stage.addEventListener("mouseleave", () => {
 });
 
 stage.addEventListener("contextmenu", (event) => {
-  if (state.mediaType === "video") {
+  if (isPlayback()) {
     showVideoContextMenu(event);
   }
 });
 
 imageLayer.addEventListener("mousedown", (event) => {
+  if (state.mediaType === "audio") return;
   if (event.button !== 0) return;
   if (event.target.closest(".video-controls")) return;
-  if (state.mediaType === "video" && event.target === video) return;
+  if (isPlayback() && event.target === video) return;
   if (event.ctrlKey && state.mediaType === "image" && state.layerDocument?.pickSupported) {
     event.preventDefault();
     void pickLayerAt(event);
