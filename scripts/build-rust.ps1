@@ -93,6 +93,18 @@ try {
       [IO.Compression.ZipFile]::CreateFromDirectory($stage, $archive, [IO.Compression.CompressionLevel]::Optimal, $false, [Text.Encoding]::UTF8)
       Remove-Item -LiteralPath $stage -Recurse -Force
 
+      # latest.yml lets 1.x installed copies (electron-updater) find this installer; its
+      # pre-install hook removes the Electron installation (rust/native/windows/installer-hooks.nsh).
+      $setupPath = Join-Path $release $setupName
+      $sha512 = [Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData([IO.File]::ReadAllBytes($setupPath)))
+      $size = (Get-Item -LiteralPath $setupPath).Length
+      $date = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
+      $yaml = @(
+        "version: $version", 'files:', "  - url: $setupName", "    sha512: $sha512", "    size: $size",
+        "path: $setupName", "sha512: $sha512", "releaseDate: '$date'"
+      )
+      [IO.File]::WriteAllLines((Join-Path $release 'latest.yml'), [string[]]$yaml, [Text.UTF8Encoding]::new($false))
+
       $sums = foreach ($asset in $setupName, "$name.zip") {
         '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $release $asset)).Hash.ToLowerInvariant(), $asset
       }

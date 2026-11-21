@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Clip Image Viewer",
   "identifier": "com.verylovefurry.clip-image-viewer",
-  "version": "2.0.0-alpha.1",
+  "version": "2.0.0-alpha.2",
   "build": { "frontendDist": "../dist" },
   "app": {
     "withGlobalTauri": true,
@@ -41,7 +41,7 @@
       "../../licenses/MPL-2.0.txt": "licenses/MPL-2.0.txt"
     },
     "windows": {
-      "nsis": { "installMode": "currentUser" }
+      "nsis": { "installMode": "currentUser", "installerHooks": "windows/installer-hooks.nsh" }
     }
   }
 }

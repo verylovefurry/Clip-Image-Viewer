@@ -135,7 +135,18 @@ release executable and NSIS installer with tauri-cli 2 (install it to
 writes `outputs/rust-release-<version>/` containing
 `Clip-Image-Viewer-Setup-<version>-rust-x64.exe`,
 `Clip-Image-Viewer-<version>-rust-windows-x64-portable.zip` and `SHA256SUMS.txt`.
-Upload all three to a GitHub release for the updater to find them.
+It also writes `latest.yml` (electron-updater format: version, installer URL,
+SHA-512 and size) so 1.x installed copies offer the Rust installer. The
+installer's pre-install hook (`rust/native/windows/installer-hooks.nsh`) silently
+runs the electron-builder uninstaller found under the fixed
+`HKCU\Software213fa-0577-5840-9762-41a24312129a` key and waits for it, so the
+Electron copy, its shortcuts and associations are removed while its user data
+(window state) stays for the Rust app to import; when started by electron-updater
+with `--force-run` the installer launches the Rust app afterwards. Associations
+must then be chosen again in the Rust settings. Upload the installer, ZIP,
+`SHA256SUMS.txt` and `latest.yml` to the GitHub release. 1.x portable copies
+also pick up the Rust ZIP (their asset pattern matches) and copy it over the old
+folder, which leaves unused Electron files behind.
 
 `scripts/collect-rust-licenses.js` walks `cargo metadata` from the native host
 (x86_64-pc-windows-msvc) and the WASM UI, skipping dev and build-script-only

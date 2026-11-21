@@ -68,12 +68,15 @@ Windows 10/11 보안 정책상 기본 앱은 사용자 확인 없이 바꿀 수 
 앱 실행 후 GitHub Releases에서 Rust 버전용 새 파일을 확인하고 내려받아 `SHA256SUMS.txt`로 검증합니다.
 설치형은 재시작할 때 새 설치 파일이 자동으로 실행되어 교체되고, 포터블은 재시작할 때 폴더의 파일을
 교체한 뒤 다시 실행합니다. 포터블 교체가 실패하면 원래 파일로 되돌립니다.
+1.x 설치형은 기존 업데이트 기능으로 2.0 설치 파일을 받으며, 설치 파일이 1.x(Electron)를 먼저 제거한 뒤
+Rust 버전을 설치하고 다시 실행합니다. 이때 파일 연결은 해제되므로 설정에서 다시 선택해야 합니다.
 
 ## 배포 파일
 
 - Windows 설치형: `Clip-Image-Viewer-Setup-버전-rust-x64.exe`
 - Windows 포터블: `Clip-Image-Viewer-버전-rust-windows-x64-portable.zip`
 - 체크섬: `SHA256SUMS.txt` (자동 업데이트에 필요)
+- `latest.yml`: 1.x 설치형 업데이트용
 
 오픈소스 라이선스 고지는 두 배포판 모두 `THIRD_PARTY_NOTICES.md`와 `licenses/` 폴더에 포함됩니다.
 
