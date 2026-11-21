@@ -1,15 +1,14 @@
-node_modules/
 outputs/
 dist/
 release/
-coverage/
 *.log
 *.tgz
 .env
 .env.*
 .DS_Store
 Thumbs.db
-work-npm-*.json
 test/*.png
 !test/sample.png
 test/samples/
+rust/target/
+rust/dist/

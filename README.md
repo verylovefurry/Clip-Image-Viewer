@@ -3,95 +3,79 @@
 Windows용 오픈소스 미디어 뷰어입니다. 일반 이미지, 최신 이미지 형식,
 동영상, 카메라 RAW, PSD, CLIP STUDIO PAINT 문서와 CMC 만화 프로젝트를 한 앱에서 봅니다.
 
+2.0부터 앱은 Rust(Tauri + WebAssembly UI)로 작성됩니다. 1.x Electron 버전의 코드는
+Git 기록(v1.8.0 커밋까지)에 남아 있습니다.
+
+> [!IMPORTANT]
+> 2.0은 코드를 Electron(JavaScript)에서 Rust로 전환했기 때문에 프로그램 구성 파일이 완전히 다릅니다.
+> **포터블 버전 사용자는 기존 포터블 폴더의 파일을 모두 삭제한 뒤 새 파일로 교체하는 것을 권장합니다.**
+> 덮어쓰기만 하면 더 이상 쓰이지 않는 Electron 파일(`resources`, `locales`, `*.pak`, `*.dll` 등)이 남습니다.
+> 창 크기·위치와 보기 설정은 포터블 폴더 밖(`%APPDATA%`, `%LOCALAPPDATA%`)에 저장되어 유지됩니다.
+
 ## 주요 기능
 
-- 이미지를 상단바와 하단바 사이에 맞춰 중앙 표시
-- 최초 실행 3:4 창, 이후 마지막 창 크기와 위치 복원
-- 이전·다음 이미지 사전 로딩
-- GitHub Releases 기반 자동 업데이트와 재시작 설치
-- 확대/축소, 이동, 회전, 반전, 전체 화면, 슬라이드쇼
-- 설정 > 보기에서 마우스 휠을 확대·축소 또는 이전·다음 파일 이동으로 선택하고 저장
-- 오디오 자동 재생, 탐색·음량·속도 조절, 순서·전체 반복·현재 파일 반복·무작위 재생
-- 커스텀 동영상 플레이어 UI, 같은 폴더의 SRT/VTT/ASS/SSA 자막 표시
-- 동영상 파일을 열면 자동 재생하고 목록에 실제 영상 프레임 썸네일 표시
-- Windows 설치형에서 WebM 탐색기 썸네일 처리기 자동 연결
+- 이미지를 상단바와 하단바 사이에 맞춰 중앙 표시, 마지막 창 크기와 위치 복원
+- 이전·다음 이미지 사전 로딩과 빠른 이동 시 이전 요청 취소
+- 확대/축소(포인터 기준), 이동, 회전, 반전, 전체 화면, 슬라이드쇼
+- 설정 > 보기에서 마우스 휠을 확대·축소 또는 이전·다음 파일 이동으로 선택
+- 동영상·오디오 재생, 같은 폴더의 SRT/VTT/ASS/SSA 자막 표시, 반복·무작위 재생
 - 미리보기 목록, 이미지 정보, 클립보드 복사, PNG 사본 저장
-- CMYK JPEG의 내장 ICC 프로파일을 적용한 sRGB 표시와 색상 일치 썸네일, 원본 파일 보존
-- ZIP/CBZ 내부 이미지 순차 보기
-- CLIP/CSP 내장 캔버스 미리보기
-- CMC 페이지 순서와 재단선·재단 여백·전체 보기
-- PSD 레이어별 비파괴 래스터 썸네일과 목록, 표시 ON/OFF, 혼합 모드·불투명도·클리핑·마스크·효과 확인
-- `Ctrl+클릭`으로 PSD 이미지의 해당 픽셀을 포함하는 레이어 선택
-- CLIP/CSP 래스터·벡터·텍스트·효과 레이어의 비파괴 래스터 미리보기와 빠른 표시 ON/OFF
-- CLIP/CSP 3D·톤·조정 필터·CSP 전용 레이어의 원본 합성 문맥 미리보기
-- CLIP/CSP 레이어 이름·계층·가시성·혼합 모드·불투명도·클리핑·마스크 정보 확인
-- CLIP 원본 속성을 기준으로 텍스트·말풍선·벡터·래스터·컷 테두리 폴더·이미지 소재·채우기·보정·용지 구분
-- 텍스트 개체별 글꼴·크기·쓰기 방향·정렬·문자 범위별 서식, 테두리·톤·표현색·편집/투명 픽셀 잠금 확인
-- 텍스트 개체의 CSP 저장 렌더 캐시가 있으면 글꼴을 다시 그리지 않고 원래 글자 픽셀·변형을 사용
-- 말풍선 레이어의 도형 채우기·곡선과 같은 레이어에 속한 텍스트를 함께 합성하고, 저장 브러시 끝 이미지를 사용한 근사 미리보기 제공
-- 레이어 정보는 문서를 열 때 읽어 보관하고, ON/OFF는 기존 합성 캐시와 목록의 부분 갱신을 사용
-- 하위 트리 사전 합성과 캐시를 이용한 빠른 폴더 ON/OFF
-- 대용량 이미지 디코딩을 별도 워커에서 처리하고 비정상 파일 크기 제한
+- CMYK JPEG의 내장 ICC 프로파일을 적용한 sRGB 표시
+- ZIP/CBZ 내부 이미지 순차 보기, CMC 페이지 순서와 재단선·재단 여백·전체 보기
+- PSD 레이어 목록과 표시 ON/OFF, `Ctrl+클릭` 레이어 선택
+- CLIP/CSP 레이어를 처음부터 분리해 합성하고, 레이어 이름·계층·혼합 모드·불투명도·클리핑·마스크 확인
+- CLIP 래스터·텍스트 개체 렌더 캐시·벡터 선·말풍선·컷 테두리·단색/그레이디언트 채우기·톤 재구성
+- GitHub Releases 기반 자동 업데이트(설치형·포터블), `SHA256SUMS.txt` 검증
 
 ## CLIP 레이어 기능 중요 안내
 
 > [!WARNING]
 > CLIP 레이어 기능은 CLIP STUDIO PAINT의 완전한 렌더러가 아닙니다.
-> 레이어를 조작하기 전에는 CLIP 파일에 저장된 CSP 캔버스 미리보기를 표시하지만,
-> 레이어 ON/OFF 후 변경된 영역은 앱이 CLIP 내부 데이터를 해석해 근사 합성합니다.
-> 저장된 텍스트 개체 래스터가 있으면 글꼴 재구성 없이 이를 사용합니다. 캐시가 없는 텍스트,
-> 벡터·톤·테두리·3D·필터·효과 레이어와 축소·혼합·마스크 결과는 CSP와 다를 수 있습니다.
-> CSP 설치나 실행은 필요하지 않습니다. 변경과 무관한 영역은 CSP 원본 미리보기 픽셀을 유지하며 원본 CLIP
-> 파일은 수정하지 않습니다. 최종 출력과 정확한 편집 결과는 반드시 CSP에서 확인해야 합니다.
+> 앱은 CLIP 파일에 저장된 레이어 데이터를 처음부터 분리해 합성하므로, 레이어를 켜고 끈 결과가
+> 서로 일관됩니다. 그러나 렌더 캐시가 없는 텍스트, 이미지 소재 변형, 보정·3D 레이어는 그리지 못하며
+> 벡터 브러시·톤·효과는 근사이므로 CSP와 다를 수 있습니다. 그리지 못한 레이어 수는 레이어 정보에 표시됩니다.
+> CSP 설치나 실행은 필요하지 않고 원본 CLIP 파일은 수정하지 않습니다. 최종 결과는 CSP에서 확인하세요.
 
 ## 지원 형식
 
 - 기본: BMP, JPG/JPEG, GIF, PNG/APNG, WebP, ICO, SVG
 - 편집/특수: PSD/PSB, DDS, JXR/HDP/WDP, J2K/JP2, TGA, TIFF,
-  PCX, PGM/PNM/PPM/PBM/PAM, BPG, EXR, QOI
+  PCX, PGM/PNM/PPM/PBM/PAM, BPG(컬러), EXR, QOI
 - 최신 형식: AVIF, JXL, HEIC/HEIF/HIF
 - 애니메이션: GIF, WebP, BPG, PNG/APNG, AVIF, JXL
-- RAW: DNG, CR2/CR3/CRW, NEF/NRW, ORF, RW2, PEF, SR2/SRF,
-  ARW, RAF 및 LibRaw가 인식하는 주요 카메라 RAW
+- RAW: DNG, CR2/CR3, NEF/NRW, ORF, RW2, PEF, SR2/SRF, ARW, RAF 등 LibRaw가 인식하는 카메라 RAW
 - CLIP STUDIO PAINT: CLIP/CSP, CMC
 - 압축 파일: ZIP, CBZ
 - 동영상: MP4/M4V, MOV/QT, WebM, MKV, AVI, WMV/ASF, FLV/F4V,
   OGV/OGG/OGM, 3GP/3G2, MPG/MPEG/MPE, M1V/M2V, TS/MTS/M2TS,
   VOB, DivX/Xvid, MXF, DV, AMV, RM/RMVB
+- 오디오: MP3, WAV/WAVE, FLAC, OGG/OGA, Opus, M4A/M4B, AAC, WebM Audio(WEBA)
 
-새 카메라 RAW 지원 범위는 함께 제공되는 LibRaw 버전에 따릅니다.
-동영상 코덱 지원 범위는 Electron/Chromium 및 Windows 코덱 지원 범위에 따릅니다.
+RAW 파일은 카메라가 저장한 내장 미리보기를 먼저 사용하고, 없거나 작으면 LibRaw로 엽니다.
+LibRaw는 앱 본체가 아니라 권한을 낮추고 메모리·시간을 제한한 별도 작업 프로세스에서만 실행됩니다.
+동영상·오디오 코덱 지원 범위는 Microsoft Edge WebView2와 Windows 코덱에 따릅니다.
+알파 채널·흑백 BPG, CRW, X3F는 2.0부터 지원하지 않습니다.
 
 ## 파일 연결
 
-오디오 지원 형식은 MP3, WAV/WAVE, FLAC, OGG/OGA, Opus, M4A/M4B, AAC, WebM Audio(WEBA)입니다.
-실제 재생 가능 여부는 파일에 사용된 코덱과 Electron의 디코더 지원에 따릅니다.
-설정의 파일 연결 목록은 이미지·동영상·오디오로 나뉘며, 오디오는 기본 연결 대상이 아닙니다.
-오디오는 동영상과 같은 재생 단축키를 사용하며 재생바가 자동으로 숨겨지지 않습니다.
-
-Windows 설치형은 기본적으로 JPG/JPEG, PNG, GIF, WebP, BMP만 연결합니다.
-설정에서 이미지 확장자와 동영상 확장자를 구분해 나머지 확장자를 각각 켜거나 끌 수 있습니다.
-
-포터블 ZIP에서는 확장자 파일 연결을 지원하지 않습니다.
-
-Windows 10/11 보안 정책상 앱이 기본 앱을 사용자 확인 없이 강제로 변경할
-수는 없습니다. 설정에서 형식을 등록한 뒤 열리는 Clip Image Viewer 전용
-Windows 기본 앱 화면에서 원하는 형식을 한 번 선택해야 합니다.
+Windows 설치형은 기본적으로 JPG/JPEG, PNG, GIF, WebP, BMP만 연결하며, 설정에서 이미지·동영상·오디오
+확장자를 각각 켜거나 끌 수 있습니다. 포터블 버전에서는 확장자 파일 연결을 지원하지 않습니다.
+Windows 10/11 보안 정책상 기본 앱은 사용자 확인 없이 바꿀 수 없으므로, 설정에서 형식을 등록한 뒤
+열리는 Windows 기본 앱 화면에서 한 번 선택해야 합니다.
 
 ## 자동 업데이트
 
-앱 실행 후 GitHub Releases에서 새 버전을 자동으로 확인하고 다운로드합니다.
-설치형은 재시작 시 새 버전으로 교체되며, 포터블판은 ZIP을 받은 뒤 기존
-폴더를 교체하고 다시 실행합니다.
-
-포터블 업데이트는 릴리스의 `SHA256SUMS.txt`와 ZIP을 대조한 뒤 적용합니다.
-업데이트 배포에는 설치 파일, 블록맵, `latest.yml`, 포터블 ZIP,
-`SHA256SUMS.txt`가 모두 필요합니다.
+앱 실행 후 GitHub Releases에서 Rust 버전용 새 파일을 확인하고 내려받아 `SHA256SUMS.txt`로 검증합니다.
+설치형은 재시작할 때 새 설치 파일이 자동으로 실행되어 교체되고, 포터블은 재시작할 때 폴더의 파일을
+교체한 뒤 다시 실행합니다. 포터블 교체가 실패하면 원래 파일로 되돌립니다.
 
 ## 배포 파일
 
-- Windows 설치형: `Clip-Image-Viewer-Setup-버전-x64.exe`
-- Windows 포터블: `Clip-Image-Viewer-버전-windows-x64-portable.zip`
+- Windows 설치형: `Clip-Image-Viewer-Setup-버전-rust-x64.exe`
+- Windows 포터블: `Clip-Image-Viewer-버전-rust-windows-x64-portable.zip`
+- 체크섬: `SHA256SUMS.txt` (자동 업데이트에 필요)
+
+오픈소스 라이선스 고지는 두 배포판 모두 `THIRD_PARTY_NOTICES.md`와 `licenses/` 폴더에 포함됩니다.
 
 ## 단축키
 
@@ -106,7 +90,7 @@ Windows 기본 앱 화면에서 원하는 형식을 한 번 선택해야 합니�
 | `F` | 좌우 반전 |
 | `I` / `T` | 정보 / 미리보기 목록 |
 | `L` | 레이어 패널 |
-| `Ctrl+클릭` | PSD 이미지 위치의 레이어 선택 |
+| `Ctrl+클릭` | 이미지 위치의 레이어 선택 |
 | `S` | 슬라이드쇼 |
 | `Enter` / `F11` | 전체 화면 |
 | `Ctrl+C` / `Ctrl+S` | 복사 / PNG 저장 |
@@ -115,55 +99,32 @@ Windows 기본 앱 화면에서 원하는 형식을 한 번 선택해야 합니�
 | `Ctrl+↑` / `Ctrl+↓` | 동영상 볼륨 올림 / 내림 |
 | `Ctrl+M` | 동영상 음소거 |
 
-이미지 위에 마우스가 있으면 `+` / `-`도 해당 위치를 기준으로 확대·축소합니다.
-마우스가 뷰어 밖에 있으면 기존 중앙 기준을 사용하며, 창 맞춤과 100% 표시는 중앙으로 복원합니다.
-
 ## 개발
 
-Node.js 22 이상을 권장합니다.
+필요한 도구: Rust MSVC 툴체인과 `wasm32-unknown-unknown` 대상, Visual C++ Build Tools와 Windows SDK,
+WebView2, Node.js(라이선스 고지 생성), `wasm-bindgen-cli` 0.2.130, 패키징용 `tauri-cli` 2.
+설치 방법과 검증 범위는 [Rust 전환 문서](docs/RUST_MIGRATION.md)에 정리했습니다.
 
-```bash
-npm install
-npm test
-npm run test:ui
-npm start
+```powershell
+./scripts/build-rust.ps1            # UI + 네이티브 릴리스 빌드
+./scripts/build-rust.ps1 -Package   # 라이선스 고지, 설치형, 포터블 ZIP, SHA256SUMS.txt
+cargo test --manifest-path rust/Cargo.toml -p clip-image-viewer-native -p clipview-core
+node test/rust-assets.test.js
 ```
 
-`test:ui`는 임시 이미지·PSD 64개로 연속 이동과 썸네일 지연 로딩을 검증합니다.
-로컬 CLIP 샘플이 있으면 `npm run test:samples`로 레이어 회귀 테스트도 실행할 수 있습니다.
-`npm run test:audio`는 외부 인코더 없이 생성한 WAV/WAVE로 오디오 재생과 휠 설정을 검사합니다.
-`npm run test:audio -- <폴더>`로 다른 로컬 오디오 형식도 검사할 수 있습니다.
-현재 로컬 검증 묶음은 기존 14개와 별도 10개 문서를 사용합니다. 개인 샘플은 Git과 배포물에서 제외합니다.
-`npm run test:layers`는 레이어 정보 표시, 목록 재사용, 폴더 가시성과 반복 ON/OFF 속도를 실제 앱에서 검사합니다.
-`npm run test:layers -- <파일.clip>`으로 다른 로컬 샘플도 검사할 수 있습니다.
-독립 렌더러의 구현 경로와 검증 범위는 [CLIP 렌더링 분석](docs/CLIP_RENDERING.md)에 정리했습니다.
-
-```bash
-npm run build
-```
-
-위 명령은 설치형, `latest.yml`, 블록맵, 포터블 ZIP을 함께 만듭니다.
+개인 CLIP·RAW 샘플을 쓰는 회귀 테스트는 `--ignored`로 실행하며, 샘플은 Git과 배포물에서 제외합니다.
 
 ## 제한
 
 - 레이어 목록과 속성은 래스터화 전의 원본 구조를 사용하며 원본 파일은 수정하지 않습니다.
-- CLIP/CSP 레이어 조작 전에는 파일에 저장된 CSP 캔버스 미리보기를 그대로 사용합니다.
-  레이어 ON/OFF 후에는 변경 영역만 비파괴 근사 합성하고 나머지 원본 픽셀을 보존합니다.
-- CLIP/CSP가 저장한 독립 레이어 래스터와 텍스트 개체 렌더 캐시를 우선 사용합니다.
-  텍스트 캐시가 없는 파일은 글꼴 재구성으로 대체하므로 설치 글꼴에 따라 달라질 수 있습니다.
-  벡터 브러시·톤·테두리·3D·효과의 완전한 CSP 동등성은 아직 검증되지 않았습니다.
-- CLIP/CSP의 저장된 래스터 mipmap, 벡터 스트로크, 용지, 텍스트 개체 렌더 캐시,
-  단색·그레이디언트 채우기는 지원 데이터 범위에서 ON/OFF 재합성합니다.
-- CLIP/CSP 전용 레이어와 원래 숨겨진 레이어를 새로 표시할 때는 근사 결과의 오차가 더
-  커질 수 있으며, CLIP 이미지 위치 기반 레이어 선택은 지원하지 않습니다.
-- PSD 레이어 ON/OFF 합성은 일반 혼합 모드·불투명도·래스터 마스크를 반영합니다.
-  일부 고급 레이어 효과, 특수 혼합 모드, 클리핑 합성은 원본과 다를 수 있습니다.
-- PSD/PSB는 저장된 합성 이미지가 있는 문서에서 가장 정확합니다.
-- 일부 RAW는 전체 현상 이미지 대신 카메라가 저장한 고해상도 미리보기를 표시합니다.
+- PSD 레이어 합성은 일반 혼합 모드·불투명도·래스터 마스크를 반영하지만, 일부 레이어 효과와
+  특수 혼합 모드는 원본과 다를 수 있습니다. 합성 이미지가 저장된 PSD/PSB가 가장 정확합니다.
+- RAW는 현상 대신 카메라 내장 미리보기를 우선 표시합니다.
 - ASS/SSA 자막은 기본 텍스트만 표시하며 고급 스타일 효과는 반영하지 않습니다.
 
 ## 라이선스
 
 Clip Image Viewer는 [MIT License](LICENSE)로 배포되는 오픈소스 프로젝트입니다.
+포함된 서드파티 구성 요소의 라이선스는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고하세요.
 
 Copyright (c) 2026 verylovefurry

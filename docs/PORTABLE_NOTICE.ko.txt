@@ -1,0 +1,14 @@
+Clip Image Viewer 포터블 사용자 안내
+
+이 버전부터 Clip Image Viewer의 코드는 Electron(JavaScript)에서 Rust로 전환되었습니다.
+프로그램 구성 파일이 완전히 달라졌으므로, 기존 포터블 버전을 사용하던 경우
+기존 포터블 폴더의 파일을 모두 삭제한 뒤 이 압축 파일의 내용으로 교체하는 것을 권장합니다.
+
+기존 파일 위에 그대로 덮어쓰면 더 이상 사용하지 않는 Electron 파일
+(resources, locales 폴더, *.pak, *.dll, *.bin 파일 등)이 폴더에 남습니다.
+
+- 창 크기·위치와 보기 설정은 포터블 폴더가 아니라 Windows 사용자 폴더(%APPDATA%, %LOCALAPPDATA%)에
+  저장되므로, 포터블 폴더를 삭제해도 유지됩니다. 기존 버전의 창 크기·위치는 처음 실행할 때 가져옵니다.
+- Rust 버전 포터블은 자동 업데이트를 지원하지 않습니다. 새 버전도 같은 방법으로 직접 교체해 주세요.
+- 실행에는 Windows 10/11에 포함된 Microsoft Edge WebView2 런타임이 필요합니다.
+- 오픈소스 라이선스 고지는 THIRD_PARTY_NOTICES.md 파일과 licenses 폴더에 있습니다.

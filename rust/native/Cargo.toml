@@ -1,0 +1,50 @@
+[package]
+name = "clip-image-viewer-native"
+version = "2.0.0-alpha.1"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "ClipImageViewer"
+path = "src/main.rs"
+
+[build-dependencies]
+cc = "1"
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+arboard = "3.6"
+base64 = "0.22"
+clipview-core = { path = "../core" }
+encoding_rs = "0.8"
+flate2 = "1"
+heif-oxide = "0.2.0"
+image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "gif", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+jxl-oxide = { version = "0.12", default-features = false, features = ["image", "lcms2"] }
+jpeg2000-decoder = { version = "=0.2.2", default-features = false }
+lcms2 = { version = "6", features = ["static"] }
+memchr = "2"
+png = "0.18"
+regex = "1"
+rfd = "0.17"
+rust_h265 = "0.4.1"
+semver = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = ["custom-protocol"] }
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+tempfile = "3"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["sync"] }
+ureq = { version = "3", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
+zune-core = "0.5"
+zune-jpeg = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }

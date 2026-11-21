@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Allows the bundled Rust UI to subscribe to native window events.",
+  "windows": ["main"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

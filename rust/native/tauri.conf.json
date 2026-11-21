@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Clip Image Viewer",
+  "identifier": "com.verylovefurry.clip-image-viewer",
+  "version": "2.0.0-alpha.1",
+  "build": { "frontendDist": "../dist" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{
+      "label": "main",
+      "create": false,
+      "title": "Clip Image Viewer",
+      "width": 720,
+      "height": 960,
+      "minWidth": 320,
+      "minHeight": 320,
+      "center": true,
+      "backgroundColor": "#111318"
+    }],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' http://clipmedia.localhost blob: data:; media-src 'self' http://clipmedia.localhost blob: data:; connect-src 'self' ipc: http://ipc.localhost http://clipmedia.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["../../build/icon.ico"],
+    "licenseFile": "../../LICENSE",
+    "resources": {
+      "../../licenses/RUST_THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "../../licenses/rust/": "licenses/rust/",
+      "../../licenses/Clip-Image-Viewer-LICENSE.txt": "licenses/Clip-Image-Viewer-LICENSE.txt",
+      "../../licenses/clip_to_psd-LICENSE.txt": "licenses/clip_to_psd-LICENSE.txt",
+      "../../licenses/libbpg-LICENSE.txt": "licenses/libbpg-LICENSE.txt",
+      "../../licenses/LibRaw-0.22.3-LICENSE.CDDL.txt": "licenses/LibRaw-0.22.3-LICENSE.CDDL.txt",
+      "../../licenses/LibRaw-0.22.3-COPYRIGHT.txt": "licenses/LibRaw-0.22.3-COPYRIGHT.txt",
+      "../../licenses/MIT.txt": "licenses/MIT.txt",
+      "../../licenses/Apache-2.0.txt": "licenses/Apache-2.0.txt",
+      "../../licenses/BSD-3-Clause.txt": "licenses/BSD-3-Clause.txt",
+      "../../licenses/BSL-1.0.txt": "licenses/BSL-1.0.txt",
+      "../../licenses/MPL-2.0.txt": "licenses/MPL-2.0.txt"
+    },
+    "windows": {
+      "nsis": { "installMode": "currentUser" }
+    }
+  }
+}

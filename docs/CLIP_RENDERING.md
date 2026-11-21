@@ -1,5 +1,9 @@
 # CSP 독립 레이어 렌더링 분석
 
+> 이 문서는 1.x Electron(JavaScript) 렌더러의 분석 기록이다. 2.0 Rust 렌더러는 레이어를 처음부터
+> 분리해 합성하며, 현재 구현과 측정값은 [Rust 전환 문서](RUST_MIGRATION.md)를 따른다.
+> 아래의 npm 명령과 스크립트는 Electron 코드와 함께 제거되었고 Git 기록(v1.8.0 커밋까지)에 남아 있다.
+
 ## 결론
 
 CSP를 실행하거나 PSD로 변환하지 않고 CLIP 내부의 저장 픽셀과 개체 정보를 읽어
@@ -89,17 +93,13 @@ CSP와 완전히 동일하다는 뜻은 아니다.** 특히 브러시, 톤, 효�
 
 ## 재현
 
-```bash
-npm test
-npm run test:samples
-npm run test:layers
-node scripts/analyze-clip-rendering.js
-node scripts/analyze-clip-rendering.js test/samples/Tos_Tos_F_ski
-npm run test:layers -- test/samples/Tos_Tos_F_ski/page0001.clip
+1.x 당시에는 `npm test`, `npm run test:samples`, `npm run test:layers`와
+`scripts/analyze-clip-rendering.js`로 재현했다. 현재는 Rust 샘플 테스트를 사용한다.
+
+```powershell
+cargo test --release --manifest-path rust/Cargo.toml -p clip-image-viewer-native separates_real -- --ignored
 ```
 
-`analyze-clip-rendering.js`는 로컬 샘플을 사용해 `preserveOriginal: false` 독립 합성과 CSP CanvasPreview를
-비교하고 작업 폴더 바깥의 `outputs/clip-renderer-research`에 PNG와 JSON 보고서를 생성한다.
 개인 CLIP 파일과 출력 이미지는 소스 저장소나 배포물에 포함하지 않는다.
 
 ## 분석 참고 자료
