@@ -231,6 +231,27 @@ pub fn composite_rgba(
     let code = mode.code();
     let glow = code == 10 || code == 12;
     let nonseparable = matches!(code, 6 | 13 | 23 | 24 | 25 | 26);
+    // Layers are mostly transparent: skip whole runs of empty source pixels at once.
+    const RUN: usize = 64;
+    let mut runs = destination.chunks_mut(RUN).zip(source.chunks(RUN));
+    for (destination, source) in &mut runs {
+        if source.chunks_exact(4).all(|p| p[3] == 0) { continue; }
+        composite_run(destination, source, code, strength, clipped, glow, nonseparable, mode)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_run(
+    destination: &mut [u8],
+    source: &[u8],
+    code: u8,
+    strength: f64,
+    clipped: bool,
+    glow: bool,
+    nonseparable: bool,
+    mode: BlendMode,
+) -> Result<(), CompositorError> {
     for (dst, src) in destination.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
         let source_alpha = src[3] as f64 / 255.0 * strength;
         if source_alpha == 0.0 {

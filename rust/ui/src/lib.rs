@@ -652,6 +652,13 @@ fn time(seconds: f64) -> String {
     }
 }
 fn update() {
+    // Trim / bleed / full views for comic pages whose document has a crop frame.
+    let (crop_available, crop) = APP.with(|a| {
+        let a = a.borrow();
+        (a.media == "image" && a.metadata["cropAvailable"].as_bool() == Some(true), a.crop.clone())
+    });
+    hidden("cropModeSelect", !crop_available);
+    el("cropModeSelect").unchecked_into::<web_sys::HtmlSelectElement>().set_value(&crop);
     let item = current();
     let name = s(&item, "name");
     text(
@@ -1164,7 +1171,7 @@ fn toggle_layer(id: String) {
     });
     render_layers();
     spawn_local(async move {
-        match call("renderLayeredImage", vec![item, json!(visibility)]).await {
+        match call("renderLayeredImage", vec![item, json!(visibility), json!(APP.with(|a| a.borrow().crop.clone()))]).await {
             Ok(result) => {
                 if APP.with(|a| {
                     let a = a.borrow();
@@ -1199,7 +1206,7 @@ fn pick_layer(event: &MouseEvent) {
     });
     let Some((item, visibility, sequence, point)) = request else { return; };
     spawn_local(async move {
-        let result = call("pickLayer", vec![item, json!(point.x), json!(point.y), json!(visibility)]).await;
+        let result = call("pickLayer", vec![item, json!(point.x), json!(point.y), json!(visibility), json!(APP.with(|a| a.borrow().crop.clone()))]).await;
         if APP.with(|a| a.borrow().sequence != sequence) { return; }
         match result {
             Ok(id) if id.as_str().is_some_and(|id| !id.is_empty()) => {
@@ -1709,7 +1716,7 @@ fn diagnostic_poll(attempt: u32) {
                         let thumb = call("loadLayerThumbnail", vec![item.clone(), json!(id)]).await;
                         let mut visibility = APP.with(|a| a.borrow().visibility.clone());
                         visibility.insert(id, !visible);
-                        let rendered = call("renderLayeredImage", vec![item, json!(visibility)]).await;
+                        let rendered = call("renderLayeredImage", vec![item, json!(visibility), json!(APP.with(|a| a.borrow().crop.clone()))]).await;
                         match (thumb, rendered) {
                             (Ok(thumb), Ok(image)) if thumb.as_str().is_some() && image["dataUrl"].as_str().is_some() => state["layerRendered"] = json!(true),
                             (Err(error), _) | (_, Err(error)) => { state["loaded"] = json!(false); state["error"] = json!(err(error)); },

@@ -103,10 +103,55 @@ pages in about 100–150 ms. Toggles compose once instead of twice. Against the
 stored CSP preview, displayed-over-white RMSE is about 45–84 (RecWild1_KR) and
 38–51 (Tos_Tos_F_ski), mean 52.7 over all 24 files; page0006 went from 158.8 to
 50.8 after the panel mask and vector strokes. **No file matches CSP pixel for
-pixel.** Still missing in Rust: font-based text fallback when a text object has
-no render cache, transformed image-material originals, low-resolution thumbnail
-fallback, and correction/3D layers. These are omitted, not approximated, and
-are counted in `unrenderedLayers`.
+pixel.**
+
+#### Accuracy pass against `D:\역식 작업` (private, not distributed)
+
+Measured with the ignored `survey_clip_list` test (`CLIPVIEW_CLIP_LIST`, one
+path per line) on 110 sampled files, comparing the composite over white with the
+stored preview at preview size. "Blurred" RMSE applies a 3 px blur first so
+halftone dot phase does not dominate. Mean RMSE went from 39.06 to 16.87 and
+blurred RMSE from 6.86 (first blurred measurement) to 4.20; a wider 553-file
+sample composes without errors at blurred RMSE 6.10. Behaviour now follows these
+stored settings:
+
+- Canvas size from `CanvasUnit` (px, cm, mm, inch, pt) and `CanvasResolution`;
+  composition is at native size, halved while over 12 MP.
+- Folders are toggleable when anything inside is drawn; frame folders clip with
+  their vector panels. Panels are filled one by one and unioned (mirrored copies
+  have opposite winding), and only the newest `VectorObjectList` entry of a frame
+  folder is used.
+- Vector layers and balloons are moved by `LayerOffsetX/Y`; point validation
+  allows for that move. Balloon texts whose bounds straddle zero are placed
+  relative to the centre of their balloon shape (n-th such text, n-th shape).
+- Layers clipped to a pass-through folder use the folder as an isolated base.
+- Correction layers (`FilterLayerInfo`): brightness/contrast (1), levels (2),
+  tone curve (3), hue/saturation/luminosity (4) and gradient map (9) — every kind
+  found in all 5,082 local files — applied with the layer's blend mode, opacity
+  and mask. 3D and other layers without pixel data use the stored thumbnail.
+- Fill and gradient layers are drawn from their settings, not a stale raster.
+- Tone effect: on/off switch, set density (source 2) and dot area linear in
+  density; edge effect honours its on/off switch.
+- Expression colour (`UsePreviewColorType`: grey or monochrome with threshold and
+  black/white switches) and layer colour (`DrawColorEnable`).
+- Story information and page number layers start hidden: CSP leaves them out of
+  its preview (`previewHidden` in the layer details); they can be switched on.
+
+Still different: CSP's brush engine (pencil-like pressure/density strokes look
+too thick and dark), noise-type tone dots, and a constant ~6/255 lightening of
+CSP tones. Font-based text fallback is still missing.
+
+#### Open-time optimization (output unchanged)
+
+`bench_clip_open` (ignored, `CLIPVIEW_CLIP_LIST`) follows `picture::load` and
+prints a hash of each composite. On the 110 files, total compose time fell from
+55.2 s to 33.5 s, the median open from 307 ms to 190 ms and the slowest file from
+4.7 s to 2.9 s, with every composite hash unchanged: transparent layer buffers are
+zero-allocated, tile rows are inflated and placed in parallel bands, tone dot
+phases advance by rotation (re-anchored every 256 px), vector strokes are stamped
+in parallel and merged band-parallel in stroke order, the vector finish pass uses
+line buffers, and blending skips empty source runs. Composition is ~95% of open
+time; reading the database and PNG encoding are ~2% and ~8%.
 
 ### Image formats added in Rust
 

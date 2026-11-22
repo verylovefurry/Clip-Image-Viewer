@@ -196,9 +196,9 @@ fn image_command(state: &Backend, method: &str, args: &[Value]) -> Result<Value>
         },
         "loadThumbnail" => picture::thumbnail(&state.assets, &item).map(Value::String),
         "loadLayerThumbnail" => clip::thumbnail(&state.assets, &item, &argument::<String>(args, 1)?),
-        "renderLayeredImage" => clip::render(&state.assets, &item, args.get(1).unwrap_or(&Value::Null)),
+        "renderLayeredImage" => clip::render(&state.assets, &item, args.get(1).unwrap_or(&Value::Null), args.get(2).and_then(Value::as_str).unwrap_or("full")),
         "prepareLayeredImage" => clip::prepare(&item),
-        "pickLayer" => clip::pick(&item, argument(args, 1)?, argument(args, 2)?, args.get(3).unwrap_or(&Value::Null)),
+        "pickLayer" => clip::pick(&item, argument(args, 1)?, argument(args, 2)?, args.get(3).unwrap_or(&Value::Null), args.get(4).and_then(Value::as_str).unwrap_or("full")),
         _ => unreachable!(),
     }
 }

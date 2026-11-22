@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "clip-image-viewer-native"
-version = "2.0.0-alpha.2"
+version = "2.0.0-alpha.3"
 dependencies = [
  "arboard",
  "base64 0.22.1",

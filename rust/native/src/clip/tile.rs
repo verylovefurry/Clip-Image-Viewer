@@ -181,7 +181,10 @@ fn read_window(file: &mut dyn ReadSeek, level: &Level, size: (u32, u32), place: 
     let (sx, sy) = (w as f64 / place.canvas.0.max(1) as f64, h as f64 / place.canvas.1.max(1) as f64);
     let (ox, oy) = place.offset;
     let [wl, wt, wr, wb] = window;
-    let mut output = RgbaImage::from_pixel(wr - wl, wb - wt, Rgba([0, 0, 0, if mask && g.fill { 255 } else { 0 }]));
+    // A zeroed allocation is far cheaper than writing every pixel of a transparent canvas.
+    let mut output = if mask && g.fill {
+        RgbaImage::from_pixel(wr - wl, wb - wt, Rgba([0, 0, 0, 255]))
+    } else { RgbaImage::new(wr - wl, wb - wt) };
     let rect = |x0: u32, y0: u32, x1: u32, y1: u32| [
         ((ox + x0 as f64) * sx).round().clamp(0., w as f64).clamp(wl as f64, wr as f64) as u32,
         ((oy + y0 as f64) * sy).round().clamp(0., h as f64).clamp(wt as f64, wb as f64) as u32,
@@ -207,52 +210,74 @@ fn read_window(file: &mut dyn ReadSeek, level: &Level, size: (u32, u32), place: 
         if pixels.len() != expected { return Err("CLIP 레이어 타일의 픽셀 길이가 일치하지 않습니다.".into()); }
         Ok(pixels)
     };
-    // Inflation dominates layer decoding and tiles are independent. Batches bound the
-    // decompressed bytes held at once; placement stays sequential and deterministic.
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
+    // Inflation dominates layer decoding. Each row of tiles fills its own band of output rows,
+    // so workers take whole tile rows: a tile is placed as soon as it is inflated, at most one
+    // decompressed tile per worker is held, and the result does not depend on scheduling.
     let stride = (wr - wl) as usize * 4;
-    let raw: &mut [u8] = &mut output;
-    for batch in jobs.chunks(threads * 4) {
-        let decoded: Vec<Result<Vec<u8>>> = if threads == 1 || batch.len() < 2 {
-            batch.iter().map(inflate).collect()
-        } else {
-            std::thread::scope(|scope| {
-                let workers: Vec<_> = batch.chunks(batch.len().div_ceil(threads))
-                    .map(|part| scope.spawn(move || part.iter().map(inflate).collect::<Vec<_>>()))
-                    .collect();
-                workers.into_iter().flat_map(|worker| worker.join().unwrap_or_else(|_| vec![Err("CLIP 타일 해제 작업이 중단되었습니다.".into())])).collect()
-            })
-        };
-        for (job, pixels) in batch.iter().zip(decoded) {
-            let pixels = pixels?;
-            let [l, t, r, b] = job.rect;
-            let (tx, ty) = job.origin;
-            let (right, bottom) = job.end;
-            let columns: Vec<usize> = (l..r).map(|x| {
-                ((((x as f64 + 0.5) / sx - ox).floor() as i64).clamp(tx as i64, right as i64 - 1) as u32 - tx) as usize
-            }).collect();
-            let bit = |plane: usize, n: usize| ((pixels[plane + (n >> 3)] >> (7 - (n & 7))) & 1) * 255;
-            for y in t..b {
-                let source_y = (((y as f64 + 0.5) / sy - oy).floor() as i64).clamp(ty as i64, bottom as i64 - 1) as u32 - ty;
-                let row = source_y as usize * TILE as usize;
-                let begin = (y - wt) as usize * stride + (l - wl) as usize * 4;
-                let line = &mut raw[begin..begin + columns.len() * 4];
-                for (out, &column) in line.chunks_exact_mut(4).zip(&columns) {
-                    let p = row + column;
-                    let rgba = match g.packing {
-                        Packing::Rgba => {
-                            let rgb = PLANE + p * 4;
-                            [pixels[rgb + 2], pixels[rgb + 1], pixels[rgb], pixels[p]]
-                        }
-                        Packing::Gray => { let gray = pixels[PLANE + p]; [gray, gray, gray, pixels[p]] }
-                        Packing::BitGray => { let gray = bit(PLANE / 8, p); [gray, gray, gray, bit(0, p)] }
-                        Packing::Alpha => [place.color[0], place.color[1], place.color[2], pixels[p]],
-                        Packing::BitAlpha => [place.color[0], place.color[1], place.color[2], bit(0, p)],
-                    };
-                    out.copy_from_slice(&rgba);
-                }
+    let [cr, cg, cb] = place.color;
+    let place_tile = |band: &mut [u8], band_top: u32, job: &Job<'_>, pixels: &[u8]| {
+        let [l, t, r, b] = job.rect;
+        let (tx, ty) = job.origin;
+        let (right, bottom) = job.end;
+        let columns: Vec<usize> = (l..r).map(|x| {
+            ((((x as f64 + 0.5) / sx - ox).floor() as i64).clamp(tx as i64, right as i64 - 1) as u32 - tx) as usize
+        }).collect();
+        let bit = |plane: usize, n: usize| ((pixels[plane + (n >> 3)] >> (7 - (n & 7))) & 1) * 255;
+        // The pixel format is fixed per level, so choose the conversion once per row.
+        fn fill(line: &mut [u8], columns: &[usize], row: usize, pixel: impl Fn(usize) -> [u8; 4]) {
+            for (out, &column) in line.chunks_exact_mut(4).zip(columns) { out.copy_from_slice(&pixel(row + column)); }
+        }
+        for y in t..b {
+            let source_y = (((y as f64 + 0.5) / sy - oy).floor() as i64).clamp(ty as i64, bottom as i64 - 1) as u32 - ty;
+            let row = source_y as usize * TILE as usize;
+            let begin = (y - band_top) as usize * stride + (l - wl) as usize * 4;
+            let line = &mut band[begin..begin + columns.len() * 4];
+            match g.packing {
+                Packing::Rgba => fill(line, &columns, row, |p| { let rgb = PLANE + p * 4; [pixels[rgb + 2], pixels[rgb + 1], pixels[rgb], pixels[p]] }),
+                Packing::Gray => fill(line, &columns, row, |p| { let gray = pixels[PLANE + p]; [gray, gray, gray, pixels[p]] }),
+                Packing::BitGray => fill(line, &columns, row, |p| { let gray = bit(PLANE / 8, p); [gray, gray, gray, bit(0, p)] }),
+                Packing::Alpha => fill(line, &columns, row, |p| [cr, cg, cb, pixels[p]]),
+                Packing::BitAlpha => fill(line, &columns, row, |p| [cr, cg, cb, bit(0, p)]),
             }
         }
+    };
+    // Group tiles by output row band; bands of consecutive tile rows never overlap.
+    let mut groups: Vec<(u32, u32, Vec<&Job<'_>>)> = Vec::new();
+    for job in &jobs {
+        match groups.last_mut() {
+            Some(group) if group.0 == job.rect[1] && group.1 == job.rect[3] => group.2.push(job),
+            _ => groups.push((job.rect[1], job.rect[3], vec![job])),
+        }
     }
+    let mut bands = Vec::with_capacity(groups.len());
+    let mut rest: &mut [u8] = &mut output;
+    let mut cursor = wt;
+    for (top, bottom, group) in groups {
+        if top < cursor { return Err("CLIP 레이어 타일 배치가 올바르지 않습니다.".into()); }
+        let (_, tail) = std::mem::take(&mut rest).split_at_mut((top - cursor) as usize * stride);
+        let (band, tail) = tail.split_at_mut((bottom - top) as usize * stride);
+        bands.push((top, band, group));
+        rest = tail;
+        cursor = bottom;
+    }
+    let work = |(top, band, group): (u32, &mut [u8], Vec<&Job<'_>>)| -> Result<()> {
+        for job in group { place_tile(band, top, job, &inflate(job)?); }
+        Ok(())
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8).min(bands.len());
+    if threads <= 1 {
+        bands.into_iter().try_for_each(work)?;
+    } else {
+        let queue = std::sync::Mutex::new(bands.into_iter());
+        std::thread::scope(|scope| -> Result<()> {
+            let workers: Vec<_> = (0..threads).map(|_| scope.spawn(|| -> Result<()> {
+                loop {
+                    let next = queue.lock().map_err(|_| "CLIP 타일 해제 작업이 중단되었습니다.".to_owned())?.next();
+                    match next { Some(band) => work(band)?, None => return Ok(()) }
+                }
+            })).collect();
+            workers.into_iter().try_for_each(|worker| worker.join().map_err(|_| "CLIP 타일 해제 작업이 중단되었습니다.".to_owned())?)
+        })?;
+    };
     Ok(output)
 }

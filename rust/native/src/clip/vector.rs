@@ -225,9 +225,10 @@ fn point(data: &[u8], offset: usize, max: (f64, f64), head: &Header, brush: Opti
     Some(Point { x, y, width, thickness, rotation, handles })
 }
 
-/// Decodes strokes from one chunk; `budget` is the remaining point allowance.
-pub fn decode(data: &[u8], native: (u32, u32), brushes: &HashMap<i64, Brush>, budget: &mut usize) -> Vec<Stroke> {
-    let max = ((f64::from(native.0) * 2.).ceil().max(4096.), (f64::from(native.1) * 2.).ceil().max(4096.));
+/// Decodes strokes from one chunk; `budget` is the remaining point allowance. `shift` is the
+/// layer move applied afterwards, so stored coordinates may lie that far outside the canvas.
+pub fn decode(data: &[u8], native: (u32, u32), shift: (f64, f64), brushes: &HashMap<i64, Brush>, budget: &mut usize) -> Vec<Stroke> {
+    let max = ((f64::from(native.0) * 2.).ceil().max(4096.) + shift.0.abs(), (f64::from(native.1) * 2.).ceil().max(4096.) + shift.1.abs());
     let mut result = Vec::new();
     let mut offset = 0;
     while offset + MIN_HEADER <= data.len() && *budget > 0 {
@@ -308,19 +309,26 @@ pub fn polygons(paths: &[Vec<(f64, f64)>], size: (u32, u32)) -> Option<(Vec<f32>
     Some((output, [left, top, right, bottom]))
 }
 
-/// Anti-aliased 0..=255 coverage of closed native-coordinate polygons over the whole output.
+/// Anti-aliased 0..=255 coverage of the union of closed native-coordinate polygons over the
+/// whole output. Each polygon is filled on its own: panels may overlap with opposite winding
+/// (mirrored layouts), which a single nonzero fill would cancel out.
 pub fn coverage(segments: &[Vec<(f64, f64)>], size: (u32, u32), native: (u32, u32)) -> Option<Vec<u8>> {
     let scale = (f64::from(size.0) / f64::from(native.0.max(1)), f64::from(size.1) / f64::from(native.1.max(1)));
-    let scaled: Vec<Vec<(f64, f64)>> = segments.iter().map(|s| s.iter().map(|&(x, y)| (x * scale.0, y * scale.1)).collect()).collect();
-    let (cover, [left, top, right, bottom]) = polygons(&scaled, size)?;
     let w = size.0 as usize;
-    let mut output = vec![0u8; w * size.1 as usize];
-    for (row, y) in (top..bottom).enumerate() {
-        for (column, x) in (left..right).enumerate() {
-            output[y * w + x] = (cover[row * (right - left) + column] * 255.).round() as u8;
+    let mut output: Option<Vec<u8>> = None;
+    for segment in segments {
+        let scaled: Vec<(f64, f64)> = segment.iter().map(|&(x, y)| (x * scale.0, y * scale.1)).collect();
+        let Some((cover, [left, top, right, bottom])) = polygons(std::slice::from_ref(&scaled), size) else { continue };
+        let output = output.get_or_insert_with(|| vec![0u8; w * size.1 as usize]);
+        for (row, y) in (top..bottom).enumerate() {
+            for (column, x) in (left..right).enumerate() {
+                let value = (cover[row * (right - left) + column] * 255.).round() as u8;
+                let cell = &mut output[y * w + x];
+                *cell = (*cell).max(value);
+            }
         }
     }
-    Some(output)
+    output
 }
 
 /// A brush-tip image resized to 128×128 with premultiplied colour.
@@ -355,6 +363,12 @@ struct Surface { left: usize, top: usize, width: usize, height: usize, data: Vec
 
 impl Surface {
     fn around(points: &[Point], size: (u32, u32), scale: f64, extra: f64) -> Self {
+        let (left, top, width, height) = Self::bounds(points, size, scale, extra);
+        Self { left, top, width, height, data: vec![0.; width * height * 4] }
+    }
+
+    /// `(left, top, width, height)` of the surface `around` would allocate.
+    fn bounds(points: &[Point], size: (u32, u32), scale: f64, extra: f64) -> (usize, usize, usize, usize) {
         let padding = points.iter().map(|p| p.width).fold(extra, f64::max) * scale + 2.;
         let (mut l, mut t, mut r, mut b) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
         for p in points {
@@ -366,8 +380,7 @@ impl Surface {
         let clamp = |v: f64, limit: u32| if v.is_finite() { v.clamp(0., f64::from(limit)) } else { 0. };
         let (left, top) = (clamp(l.floor(), size.0) as usize, clamp(t.floor(), size.1) as usize);
         let (right, bottom) = (clamp(r.ceil(), size.0) as usize, clamp(b.ceil(), size.1) as usize);
-        let (width, height) = (right.saturating_sub(left), bottom.saturating_sub(top));
-        Self { left, top, width, height, data: vec![0.; width * height * 4] }
+        (left, top, right.saturating_sub(left), bottom.saturating_sub(top))
     }
 }
 
@@ -475,6 +488,37 @@ fn stamp_pattern(surface: &mut Surface, pattern: &Pattern, x: f64, y: f64, width
     Ok(())
 }
 
+/// Merges surfaces in order onto `target`, splitting the canvas into row bands across threads.
+/// Each pixel still receives the surfaces in the same order, so the result is unchanged.
+fn merge_all(target: &mut [f32], width: usize, height: usize, surfaces: &[(Surface, f64)], threads: usize) {
+    if surfaces.is_empty() { return; }
+    let rows: usize = surfaces.iter().map(|(s, _)| s.width * s.height).sum::<usize>() / width.max(1);
+    if threads == 1 || rows < 256 {
+        for (surface, opacity) in surfaces { merge(target, width, surface, *opacity); }
+        return;
+    }
+    let rows_per_band = height.div_ceil(threads).max(16);
+    std::thread::scope(|scope| {
+        for (band, part) in target.chunks_mut(rows_per_band * width * 4).enumerate() {
+            let (first, last) = (band * rows_per_band, band * rows_per_band + part.len() / (width * 4));
+            scope.spawn(move || {
+                for (surface, opacity) in surfaces {
+                    let (top, bottom) = (surface.top.max(first), (surface.top + surface.height).min(last));
+                    for y in top..bottom {
+                        let row = &surface.data[((y - surface.top) * surface.width) * 4..][..surface.width * 4];
+                        for (x, source) in row.chunks_exact(4).enumerate() {
+                            let alpha = source[3] * *opacity as f32;
+                            if alpha <= 0. { continue; }
+                            let index = ((y - first) * width + x + surface.left) * 4;
+                            over(&mut part[index..index + 4], [source[0], source[1], source[2]], alpha);
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// Source-over of a straight-alpha float surface (colour 0..1) onto an RGBA float canvas.
 fn merge(target: &mut [f32], width: usize, surface: &Surface, opacity: f64) {
     for y in 0..surface.height {
@@ -493,6 +537,76 @@ pub trait Tips {
     fn tip(&mut self, brush: &Brush, stroke: &Stroke) -> Result<Option<std::rc::Rc<Pattern>>>;
 }
 
+/// Stamp count along one segment for the brush spacing at output `scale`.
+fn segment_steps(previous: &Point, point: &Point, brush: Option<&Brush>, scale: f64) -> f64 {
+    let distance = (point.x - previous.x).hypot(point.y - previous.y) * scale;
+    let thinnest = (previous.width * previous.thickness).min(point.width * point.thickness) * scale;
+    let spacing = match brush {
+        Some(b) if b.pattern.is_some() => (thinnest * if b.auto_interval { 0.15 } else { b.interval }).max(0.5),
+        _ => (thinnest * 0.4).clamp(0.25, 1.),
+    };
+    (distance / spacing).ceil().max(1.)
+}
+
+/// Stamps one stroke into its own surface. Strokes are independent until they are merged, so
+/// this runs in parallel; the returned count is the pattern pixels visited.
+fn draw_stroke(stroke: &Stroke, brush: Option<&Brush>, path: &[Point], tip: Option<&Pattern>, size: (u32, u32), scale: f64, reduction: f64) -> Result<(Surface, u64)> {
+    let mut visits = 0u64;
+    let mut random_state = (if stroke.seed == 0 { 1 } else { stroke.seed }) ^ brush.map_or(0, |b| b.id as u32);
+    let mut random = || { random_state = random_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); f64::from(random_state) / 4_294_967_296. };
+    let mut surface = Surface::around(path, size, scale, if tip.is_some() { brush.map_or(0., |b| b.spray_size) } else { 0. });
+    let mut stamp = |previous: &Point, point: &Point, ratio: f64, surface: &mut Surface| -> Result<()> {
+        let (cx, cy) = curve(previous, point, ratio);
+        let (mut x, mut y) = (cx * scale, cy * scale);
+        let mut brush_width = (previous.width + (point.width - previous.width) * ratio).max(0.01) * scale;
+        let thickness = (previous.thickness + (point.thickness - previous.thickness) * ratio).clamp(0.01, 1.);
+        let mut delta = (point.rotation - previous.rotation) % 360.;
+        if delta > 180. { delta -= 360.; }
+        if delta < -180. { delta += 360.; }
+        let mut rotation = previous.rotation + delta * ratio;
+        if let (Some(b), Some(_)) = (brush.filter(|b| b.spray), tip) {
+            let angle = random() * std::f64::consts::TAU;
+            let radius = brush_width / 2. * random().powf((1. + b.spray_bias) / 2.);
+            x += angle.cos() * radius;
+            y += angle.sin() * radius;
+            let effector = &b.spray_effector.random;
+            let factor = if effector.enabled { effector.minimum + random() * (1. - effector.minimum) } else { 1. };
+            brush_width = (b.spray_size * scale * factor).max(0.01);
+            if b.spray_rotation_effector & 0x80 != 0 { rotation += random() * 360. * b.spray_rotation_random; }
+        } else if tip.is_some() && brush.is_none_or(|b| b.rotation_effector & 0x10 == 0) {
+            rotation += (point.y - previous.y).atan2(point.x - previous.x).to_degrees() + 90.;
+        }
+        if let Some(tip) = tip {
+            return stamp_pattern(surface, tip, x, y, brush_width * tip.aspect.0, brush_width * thickness * tip.aspect.1, rotation, &mut visits);
+        }
+        let rx = (brush_width / 2.).max(0.005);
+        let ry = (rx * thickness).max(0.005);
+        let (sin, cos) = rotation.to_radians().sin_cos();
+        let reach = rx.max(ry).max(0.5) + 1.;
+        let (ox, oy) = (x - surface.left as f64, y - surface.top as f64);
+        let x0 = (ox - reach).floor().max(0.) as usize;
+        let y0 = (oy - reach).floor().max(0.) as usize;
+        let x1 = ((ox + reach).ceil().max(0.) as usize).min(surface.width);
+        let y1 = ((oy + reach).ceil().max(0.) as usize).min(surface.height);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let cover = ellipse(px as f64 + 0.5 - ox, py as f64 + 0.5 - oy, rx, ry, cos, sin) as f32;
+                if cover > 0. {
+                    let alpha = &mut surface.data[(py * surface.width + px) * 4 + 3];
+                    *alpha += cover * (1. - *alpha);
+                }
+            }
+        }
+        Ok(())
+    };
+    stamp(&path[0], &path[0], 0., &mut surface)?;
+    for pair in path.windows(2) {
+        let count = (segment_steps(&pair[0], &pair[1], brush, scale) / reduction).ceil().max(1.) as u32;
+        for step in 1..=count { stamp(&pair[0], &pair[1], f64::from(step) / f64::from(count), &mut surface)?; }
+    }
+    Ok((surface, visits))
+}
+
 /// Renders strokes at the output size. Coordinates are native canvas pixels scaled by
 /// `min(width/nativeWidth, height/nativeHeight)`, as in the reference renderer.
 pub fn render(strokes: &[Stroke], brushes: &HashMap<i64, Brush>, tips: &mut dyn Tips, size: (u32, u32), native: (u32, u32), frame: bool) -> Result<RgbaImage> {
@@ -509,17 +623,8 @@ pub fn render(strokes: &[Stroke], brushes: &HashMap<i64, Brush>, tips: &mut dyn 
         if (frame || stroke.closed) && points.len() >= 3 { points.push(points[0].clone()); }
         points
     }).collect();
-    let steps = |previous: &Point, point: &Point, brush: Option<&Brush>| -> f64 {
-        let distance = (point.x - previous.x).hypot(point.y - previous.y) * scale;
-        let thinnest = (previous.width * previous.thickness).min(point.width * point.thickness) * scale;
-        let spacing = match brush {
-            Some(b) if b.pattern.is_some() => (thinnest * if b.auto_interval { 0.15 } else { b.interval }).max(0.5),
-            _ => (thinnest * 0.4).clamp(0.25, 1.),
-        };
-        (distance / spacing).ceil().max(1.)
-    };
     let desired: f64 = paths.len() as f64 + paths.iter().zip(&expanded)
-        .map(|(path, (_, brush))| path.windows(2).map(|p| steps(&p[0], &p[1], *brush)).sum::<f64>()).sum::<f64>();
+        .map(|(path, (_, brush))| path.windows(2).map(|p| segment_steps(&p[0], &p[1], *brush, scale)).sum::<f64>()).sum::<f64>();
     let reduction = (desired / MAX_STAMPS).max(1.);
     let mut before: Option<Vec<f32>> = None;
     let mut after: Option<Vec<f32>> = None;
@@ -531,73 +636,72 @@ pub fn render(strokes: &[Stroke], brushes: &HashMap<i64, Brush>, tips: &mut dyn 
     };
     let mut deferred: Vec<(Surface, [u8; 3], f64)> = Vec::new();
     let mut visits = 0u64;
-    for ((stroke, brush), path) in expanded.iter().zip(&paths) {
-        if path.is_empty() { continue; }
-        let mut random_state = (if stroke.seed == 0 { 1 } else { stroke.seed }) ^ brush.map_or(0, |b| b.id as u32);
-        let mut random = || { random_state = random_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); f64::from(random_state) / 4_294_967_296. };
-        let tip = match brush { Some(b) => tips.tip(b, stroke)?, None => None };
-        let mut surface = Surface::around(path, size, scale, if tip.is_some() { brush.map_or(0., |b| b.spray_size) } else { 0. });
-        let mut stamp = |previous: &Point, point: &Point, ratio: f64, surface: &mut Surface| -> Result<()> {
-            let (cx, cy) = curve(previous, point, ratio);
-            let (mut x, mut y) = (cx * scale, cy * scale);
-            let mut brush_width = (previous.width + (point.width - previous.width) * ratio).max(0.01) * scale;
-            let thickness = (previous.thickness + (point.thickness - previous.thickness) * ratio).clamp(0.01, 1.);
-            let mut delta = (point.rotation - previous.rotation) % 360.;
-            if delta > 180. { delta -= 360.; }
-            if delta < -180. { delta += 360.; }
-            let mut rotation = previous.rotation + delta * ratio;
-            if let (Some(b), Some(_)) = (brush.filter(|b| b.spray), tip.as_ref()) {
-                let angle = random() * std::f64::consts::TAU;
-                let radius = brush_width / 2. * random().powf((1. + b.spray_bias) / 2.);
-                x += angle.cos() * radius;
-                y += angle.sin() * radius;
-                let effector = &b.spray_effector.random;
-                let factor = if effector.enabled { effector.minimum + random() * (1. - effector.minimum) } else { 1. };
-                brush_width = (b.spray_size * scale * factor).max(0.01);
-                if b.spray_rotation_effector & 0x80 != 0 { rotation += random() * 360. * b.spray_rotation_random; }
-            } else if tip.is_some() && brush.is_none_or(|b| b.rotation_effector & 0x10 == 0) {
-                rotation += (point.y - previous.y).atan2(point.x - previous.x).to_degrees() + 90.;
-            }
-            if let Some(tip) = &tip {
-                return stamp_pattern(surface, tip, x, y, brush_width * tip.aspect.0, brush_width * thickness * tip.aspect.1, rotation, &mut visits);
-            }
-            let rx = (brush_width / 2.).max(0.005);
-            let ry = (rx * thickness).max(0.005);
-            let (sin, cos) = rotation.to_radians().sin_cos();
-            let reach = rx.max(ry).max(0.5) + 1.;
-            let (ox, oy) = (x - surface.left as f64, y - surface.top as f64);
-            let x0 = (ox - reach).floor().max(0.) as usize;
-            let y0 = (oy - reach).floor().max(0.) as usize;
-            let x1 = ((ox + reach).ceil().max(0.) as usize).min(surface.width);
-            let y1 = ((oy + reach).ceil().max(0.) as usize).min(surface.height);
-            for py in y0..y1 {
-                for px in x0..x1 {
-                    let cover = ellipse(px as f64 + 0.5 - ox, py as f64 + 0.5 - oy, rx, ry, cos, sin) as f32;
-                    if cover > 0. {
-                        let alpha = &mut surface.data[(py * surface.width + px) * 4 + 3];
-                        *alpha += cover * (1. - *alpha);
-                    }
-                }
-            }
-            Ok(())
+    // Brush tips come from a per-document cache, so they are looked up in order first.
+    let tip_handles = expanded.iter().map(|(stroke, brush)| match brush { Some(b) => tips.tip(b, stroke), None => Ok(None) }).collect::<Result<Vec<_>>>()?;
+    let tip_refs: Vec<Option<&Pattern>> = tip_handles.iter().map(|tip| tip.as_deref()).collect();
+    // Batches bound the stroke surfaces alive at once to about one canvas of pixels.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
+    let budget = (w * h).max(1);
+    let mut index = 0;
+    while index < expanded.len() {
+        let mut end = index;
+        let mut area = 0usize;
+        while end < expanded.len() && (end == index || area < budget) {
+            let bounds = Surface::bounds(&paths[end], size, scale, 0.);
+            area = area.saturating_add(bounds.2.saturating_mul(bounds.3));
+            end += 1;
+        }
+        let draw = |i: usize| -> Result<(Surface, u64)> {
+            if paths[i].is_empty() { return Ok((Surface { left: 0, top: 0, width: 0, height: 0, data: Vec::new() }, 0)); }
+            let (mut surface, visits) = draw_stroke(&expanded[i].0, expanded[i].1, &paths[i], tip_refs[i], size, scale, reduction)?;
+            if tip_refs[i].is_none() { tint(&mut surface, expanded[i].0.color); }
+            Ok((surface, visits))
         };
-        stamp(&path[0], &path[0], 0., &mut surface)?;
-        for pair in path.windows(2) {
-            let count = (steps(&pair[0], &pair[1], *brush) / reduction).ceil().max(1.) as u32;
-            for step in 1..=count { stamp(&pair[0], &pair[1], f64::from(step) / f64::from(count), &mut surface)?; }
-        }
-        let spray = brush.is_some_and(|b| b.spray);
-        if tip.is_some() {
-            let target = if spray { &mut after } else { &mut before }.get_or_insert_with(|| vec![0.; w * h * 4]);
-            merge(target, w, &surface, stroke.opacity);
-            touch(surface.left, surface.top, surface.left + surface.width, surface.top + surface.height);
-        } else if spray {
-            deferred.push((surface, stroke.color, stroke.opacity));
+        let drawn: Vec<Result<(Surface, u64)>> = if threads == 1 || end - index < 2 {
+            (index..end).map(draw).collect()
         } else {
-            tint(&mut surface, stroke.color);
-            merge(&mut body, w, &surface, stroke.opacity);
-            touch(surface.left, surface.top, surface.left + surface.width, surface.top + surface.height);
+            let next = std::sync::atomic::AtomicUsize::new(index);
+            let slots: Vec<std::sync::Mutex<Option<Result<(Surface, u64)>>>> = (index..end).map(|_| std::sync::Mutex::new(None)).collect();
+            std::thread::scope(|scope| {
+                for _ in 0..threads.min(end - index) {
+                    scope.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= end { break; }
+                        let result = draw(i);
+                        if let Ok(mut slot) = slots[i - index].lock() { *slot = Some(result); }
+                    });
+                }
+            });
+            slots.into_iter().map(|slot| slot.into_inner().ok().flatten().unwrap_or_else(|| Err("CLIP 벡터 렌더링 작업이 중단되었습니다.".into()))).collect()
+        };
+        // Merge in stroke order so overlapping strokes blend exactly as when drawn one by one;
+        // row bands are independent, so each target is merged band-parallel.
+        let mut to_body = Vec::new();
+        let mut to_before = Vec::new();
+        let mut to_after = Vec::new();
+        for (i, result) in (index..end).zip(drawn) {
+            if paths[i].is_empty() { continue; }
+            let (surface, count) = result?;
+            visits += count;
+            if visits > MAX_PATTERN_VISITS { return Err("CLIP 브러시 합성의 안전 처리 한도를 초과했습니다.".into()); }
+            let (stroke, brush) = &expanded[i];
+            let spray = brush.is_some_and(|b| b.spray);
+            if tip_refs[i].is_some() {
+                touch(surface.left, surface.top, surface.left + surface.width, surface.top + surface.height);
+                if spray { to_after.push((surface, stroke.opacity)); } else { to_before.push((surface, stroke.opacity)); }
+            } else if spray {
+                deferred.push((surface, stroke.color, stroke.opacity));
+            } else {
+                touch(surface.left, surface.top, surface.left + surface.width, surface.top + surface.height);
+                to_body.push((surface, stroke.opacity));
+            }
         }
+        {
+            merge_all(&mut body, w, h, &to_body, threads);
+            if !to_before.is_empty() { merge_all(before.get_or_insert_with(|| vec![0.; w * h * 4]), w, h, &to_before, threads); }
+            if !to_after.is_empty() { merge_all(after.get_or_insert_with(|| vec![0.; w * h * 4]), w, h, &to_after, threads); }
+        };
+        index = end;
     }
     for (stroke, _) in &expanded {
         let Some(color) = stroke.fill else { continue };
@@ -620,15 +724,28 @@ pub fn render(strokes: &[Stroke], brushes: &HashMap<i64, Brush>, tips: &mut dyn 
     let [left, top, right, bottom] = dirty;
     let mut image = RgbaImage::new(size.0, size.1);
     if left >= right || top >= bottom { return Ok(image); }
-    let mut canvas = before.unwrap_or_else(|| vec![0.; w * h * 4]);
     let byte = |v: f32| (v * 255.).round().clamp(0., 255.) as u8;
+    // Rows are independent: compose each one in a line buffer (zeros when nothing was drawn
+    // with brush tips) instead of a whole extra canvas, band-parallel.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
+    let rows_per_band = (bottom - top).div_ceil(threads).max(16);
+    let (before, after, body) = (before.as_deref(), after.as_deref(), &body);
     let raw: &mut [u8] = &mut image;
-    for y in top..bottom {
-        let span = (y * w + left) * 4..(y * w + right) * 4;
-        composite(&mut canvas[span.clone()], &body[span.clone()]);
-        if let Some(after) = &after { composite(&mut canvas[span.clone()], &after[span.clone()]); }
-        for (out, value) in raw[span.clone()].iter_mut().zip(&canvas[span]) { *out = byte(*value); }
-    }
+    std::thread::scope(|scope| {
+        for (band, out) in raw[top * w * 4..bottom * w * 4].chunks_mut(rows_per_band * w * 4).enumerate() {
+            scope.spawn(move || {
+                let mut line = vec![0f32; (right - left) * 4];
+                for (row, out) in out.chunks_mut(w * 4).enumerate() {
+                    let y = top + band * rows_per_band + row;
+                    let span = (y * w + left) * 4..(y * w + right) * 4;
+                    match before { Some(before) => line.copy_from_slice(&before[span.clone()]), None => line.fill(0.) }
+                    composite(&mut line, &body[span.clone()]);
+                    if let Some(after) = after { composite(&mut line, &after[span]); }
+                    for (o, v) in out[left * 4..right * 4].iter_mut().zip(&line) { *o = byte(*v); }
+                }
+            });
+        }
+    });
     Ok(image)
 }
 
@@ -698,7 +815,7 @@ mod tests {
         let pressure = Effector { enabled: true, minimum: 0.5, graph: None };
         brushes.insert(7, Brush { id: 7, size: SizeEffector { pressure, velocity_maximum: 1., ..Default::default() }, ..Default::default() });
         let mut budget = MAX_POINTS;
-        let strokes = decode(&data, (100, 100), &brushes, &mut budget);
+        let strokes = decode(&data, (100, 100), (0., 0.), &brushes, &mut budget);
         assert_eq!(strokes.len(), 1);
         let stroke = &strokes[0];
         assert_eq!((stroke.color, stroke.fill, stroke.closed, stroke.brush), ([255, 0, 0], Some([0, 255, 0]), true, Some(7)));
@@ -706,14 +823,14 @@ mod tests {
         assert_eq!(stroke.points.iter().map(|p| p.width).collect::<Vec<_>>(), vec![4., 3., 2.]);
         assert_eq!(budget, MAX_POINTS - 3);
         let mut empty = 0;
-        assert!(decode(&data, (100, 100), &brushes, &mut empty).is_empty());
+        assert!(decode(&data, (100, 100), (0., 0.), &brushes, &mut empty).is_empty());
     }
 
     #[test]
     fn renders_round_stroke_and_closed_fill_under_body() {
         let data = chunk(&[(10., 10., 1.), (90., 10., 1.), (90., 90., 1.), (10., 90., 1.)], true);
         let mut budget = MAX_POINTS;
-        let strokes = decode(&data, (100, 100), &HashMap::new(), &mut budget);
+        let strokes = decode(&data, (100, 100), (0., 0.), &HashMap::new(), &mut budget);
         let image = render(&strokes, &HashMap::new(), &mut NoTips, (100, 100), (100, 100), false).unwrap();
         // Stroke body (red) on the outline, green fill inside, transparent outside.
         // The fill is painted after stroke bodies, so check the stroke's outer half.

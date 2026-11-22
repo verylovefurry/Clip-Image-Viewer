@@ -174,22 +174,29 @@ fn headers_file(path: &Path, ext: &str) -> Result<(Value, bool)> {
     Ok((metadata(width, height, if ext == "jpg" || ext == "jfif" { "jpeg" } else { ext }, color.channel_count()), cmyk))
 }
 
-fn crop_image(image: DynamicImage, crop: Option<Crop>, mode: &str) -> DynamicImage {
-    let Some(crop) = crop.filter(|_| matches!(mode, "trim" | "bleed")) else { return image };
-    if crop.canvas_width <= 0. || crop.canvas_height <= 0. { return image; }
+/// Pixel rectangle `[left, top, right, bottom)` of the trim ("trim") or trim + bleed ("bleed")
+/// area of a comic page in an image of `width`×`height`; `None` for "full" or no crop frame.
+pub fn crop_rect(crop: &Crop, mode: &str, width: u32, height: u32) -> Option<[u32; 4]> {
+    if !matches!(mode, "trim" | "bleed") || crop.canvas_width <= 0. || crop.canvas_height <= 0. { return None; }
     let extra = if mode == "bleed" { crop.bleed.max(0.) * 2. } else { 0. };
     let w = (crop.trim_width + extra) * crop.page_count.max(1.);
     let h = crop.trim_height + extra;
     let x = (crop.canvas_width - w) / 2. + crop.offset_x;
     let y = (crop.canvas_height - h) / 2. + crop.offset_y;
-    let scale_x = image.width() as f64 / crop.canvas_width;
-    let scale_y = image.height() as f64 / crop.canvas_height;
+    let scale_x = f64::from(width) / crop.canvas_width;
+    let scale_y = f64::from(height) / crop.canvas_height;
     let l = (x.max(0.) * scale_x).round() as u32;
     let t = (y.max(0.) * scale_y).round() as u32;
     let r = ((x + w).min(crop.canvas_width) * scale_x).round() as u32;
     let b = ((y + h).min(crop.canvas_height) * scale_y).round() as u32;
-    if r > l && b > t && r <= image.width() && b <= image.height() { image.crop_imm(l, t, r - l, b - t) }
-    else { image }
+    (r > l && b > t && r <= width && b <= height).then_some([l, t, r, b])
+}
+
+fn crop_image(image: DynamicImage, crop: Option<Crop>, mode: &str) -> DynamicImage {
+    match crop.and_then(|crop| crop_rect(&crop, mode, image.width(), image.height())) {
+        Some([l, t, r, b]) => image.crop_imm(l, t, r - l, b - t),
+        None => image,
+    }
 }
 
 pub fn result(item: &Item, data_url: String, mut meta: Value, doc: Value, source: &str, crop: bool, encoded_size: Option<usize>) -> Result<Value> {
@@ -214,10 +221,15 @@ fn animation(assets: &Assets, item: &Item, apng: Vec<u8>, format: &str, frames: 
 }
 
 pub fn rendered(assets: &Assets, item: &Item, image: RgbaImage, doc: Value, source: &str) -> Result<Value> {
+    rendered_area(assets, item, image, doc, source, false)
+}
+
+/// Like [`rendered`], also reporting whether trim/bleed views are available.
+pub fn rendered_area(assets: &Assets, item: &Item, image: RgbaImage, doc: Value, source: &str, crop: bool) -> Result<Value> {
     let meta = metadata(image.width(), image.height(), "PNG", 4);
     let bytes = encode(&image)?;
     let count = bytes.len();
-    result(item, assets.bytes(bytes, "image/png")?, meta, doc, source, false, Some(count))
+    result(item, assets.bytes(bytes, "image/png")?, meta, doc, source, crop, Some(count))
 }
 
 fn psd_composite(item: &Item) -> Result<RgbaImage> {

@@ -24,7 +24,10 @@ const SQLITE: &[u8] = b"SQLite format 3\0";
 const MAX_DATABASE: u64 = 256 << 20;
 const MAX_PREVIEW: i64 = 96 << 20;
 const MAX_LAYERS: usize = 8_192;
-const MAX_COMPOSITE_BYTES: u64 = 256 << 20;
+const MAX_COMPOSITE_BYTES: u64 = 1 << 30;
+/// Composite pixel budget. Larger canvases are shown at 1/2, 1/4, ... of their size so every
+/// output pixel maps onto one stored mipmap level instead of being resampled.
+const MAX_DISPLAY_PIXELS: u64 = 12 * 1024 * 1024;
 
 fn open_source(item: &Item) -> Result<Box<dyn ReadSeek>> {
     match item {
@@ -175,7 +178,10 @@ fn canvas(db: &Connection) -> Result<Canvas> {
 struct Edge { width: f64, color: [u8; 3] }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Tone { frequency: f64, angle: u32, resolution: f64 }
+/// Tone (halftone) layer effect. `EffectTone` stores `[enabled u32][resolution f64][dot kind u32]
+/// [density source u32][density % u32][frequency f64][u32][u32][angle u32]` (byte offsets 0, 4, 12,
+/// 16, 20, 24, 32, 36, 40).
+struct Tone { frequency: f64, angle: u32, resolution: f64, enabled: bool, kind: u32, source: u32, density: f64 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Stop { color: [u8; 3], opacity: u8, position: f64 }
@@ -322,24 +328,56 @@ fn apply_tone(image: &mut RgbaImage, tone: Tone, size: (u32, u32), native: (u32,
     let (sine, cosine) = f64::from(tone.angle).to_radians().sin_cos();
     let transition = (0.5 / cell).clamp(0.08, 0.5);
     let tau = std::f64::consts::TAU;
-    let width = image.width() as usize;
-    let shade = |y: u32, line: &mut [u8]| for (x, pixel) in line.chunks_exact_mut(4).enumerate() {
-        let x = x as u32;
-        let alpha = f64::from(pixel[3]) / 255.;
-        if alpha == 0. { continue; }
-        let luminance = (f64::from(pixel[0]) * 0.2126 + f64::from(pixel[1]) * 0.7152 + f64::from(pixel[2]) * 0.0722) / 255.;
-        let density = ((1. - luminance) * alpha).clamp(0., 1.);
-        let mut dot = 0.;
-        for offset_y in [0.25, 0.75] {
-            for offset_x in [0.25, 0.75] {
-                let (px, py) = (x as f64 + offset_x, y as f64 + offset_y);
-                let rx = (px * cosine + py * sine) / cell;
-                let ry = (-px * sine + py * cosine) / cell;
-                let spot = (2. - (rx * tau).cos() - (ry * tau).cos()) / 4.;
-                dot += ((density - spot) / transition + 0.5).clamp(0., 1.);
+    // Rank of each spot value within a cell, so dot area grows linearly with density like CSP's
+    // tones (the raw cosine spot would darken shadows and lighten highlights).
+    const STEPS: usize = 1024;
+    static RANK: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let rank = RANK.get_or_init(|| {
+        let mut histogram = vec![0u32; STEPS + 1];
+        let n = 256;
+        for j in 0..n {
+            for i in 0..n {
+                let (a, b) = ((i as f64 + 0.5) / n as f64 * tau, (j as f64 + 0.5) / n as f64 * tau);
+                histogram[(((2. - a.cos() - b.cos()) / 4.) * STEPS as f64).round() as usize] += 1;
             }
         }
-        pixel.copy_from_slice(&[0, 0, 0, (255. * dot / 4. * alpha).round() as u8]);
+        let mut total = 0u32;
+        histogram.iter().map(|&count| { let below = total; total += count; (f64::from(below) + f64::from(count) / 2.) / f64::from(n * n) }).collect()
+    });
+    let width = image.width() as usize;
+    // Phases of the four sub-samples advance by a fixed step per pixel, so the cosines are
+    // updated by rotation instead of evaluated; they are recomputed exactly every 256 pixels.
+    let phase = |px: f64, py: f64| (((px * cosine + py * sine) / cell) * tau, ((-px * sine + py * cosine) / cell) * tau);
+    let (step_a, step_b) = (cosine / cell * tau, -sine / cell * tau);
+    let (rotate_a, rotate_b) = ((step_a.cos(), step_a.sin()), (step_b.cos(), step_b.sin()));
+    const OFFSETS: [(f64, f64); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+    let shade = |y: u32, line: &mut [u8]| {
+        let mut rotors = [[(0f64, 0f64); 2]; 4];
+        for (x, pixel) in line.chunks_exact_mut(4).enumerate() {
+            if x % 256 == 0 {
+                for (rotor, (ox, oy)) in rotors.iter_mut().zip(OFFSETS) {
+                    let (a, b) = phase(x as f64 + ox, f64::from(y) + oy);
+                    *rotor = [(a.cos(), a.sin()), (b.cos(), b.sin())];
+                }
+            } else {
+                for rotor in &mut rotors {
+                    for (value, (c, s)) in rotor.iter_mut().zip([rotate_a, rotate_b]) {
+                        *value = (value.0 * c - value.1 * s, value.1 * c + value.0 * s);
+                    }
+                }
+            }
+            let alpha = f64::from(pixel[3]) / 255.;
+            if alpha == 0. { continue; }
+            let luminance = (f64::from(pixel[0]) * 0.2126 + f64::from(pixel[1]) * 0.7152 + f64::from(pixel[2]) * 0.0722) / 255.;
+            // Source 2 uses the set density instead of the image brightness.
+            let density = (if tone.source == 2 { tone.density } else { 1. - luminance } * alpha).clamp(0., 1.);
+            let mut dot = 0.;
+            for rotor in &rotors {
+                let spot = rank[(((2. - rotor[0].0 - rotor[1].0) / 4.).clamp(0., 1.) * STEPS as f64).round() as usize];
+                dot += ((density - spot) / transition + 0.5).clamp(0., 1.);
+            }
+            pixel.copy_from_slice(&[0, 0, 0, (255. * dot / 4. * alpha).round() as u8]);
+        }
     };
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
     let rows = (image.height() as usize).div_ceil(threads).max(1);
@@ -353,8 +391,240 @@ fn apply_tone(image: &mut RgbaImage, tone: Tone, size: (u32, u32), native: (u32,
     });
 }
 
+/// Layer property "expression colour" applied when displaying a colour layer
+/// (`UsePreviewColorType`): grey, or monochrome with a threshold and black/white switches.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PreviewColor { monochrome: bool, black: bool, white: bool, threshold: f64, alpha_threshold: f64 }
+
+fn apply_preview_color(image: &mut RgbaImage, mode: PreviewColor) {
+    let threshold = (mode.threshold * 255.).round() as u32;
+    let alpha_threshold = (mode.alpha_threshold * 255.).round() as u8;
+    for p in image.pixels_mut() {
+        if p[3] == 0 { continue; }
+        let luma = (299 * u32::from(p[0]) + 587 * u32::from(p[1]) + 114 * u32::from(p[2]) + 500) / 1000;
+        if mode.monochrome {
+            let dark = luma < threshold.max(1);
+            if alpha_threshold > 0 { p[3] = if p[3] >= alpha_threshold { 255 } else { 0 }; }
+            let keep = if dark { mode.black } else { mode.white };
+            let v = if dark { 0 } else { 255 };
+            *p = Rgba([v, v, v, if keep { p[3] } else { 0 }]);
+        } else {
+            let v = luma as u8;
+            *p = Rgba([v, v, v, p[3]]);
+        }
+    }
+}
+
+/// Correction layer settings from `FilterLayerInfo`: `[kind u32][size u32][payload]`.
+#[derive(Clone, Debug, PartialEq)]
+enum Correction {
+    /// Brightness and contrast, -100..=100.
+    BrightnessContrast(f64, f64),
+    /// RGB master, red, green and blue curves; points in 0..=1.
+    ToneCurve(Vec<Vec<(f64, f64)>>),
+    /// Hue shift in degrees, saturation and luminosity in -100..=100.
+    HueSaturation(f64, f64, f64),
+    /// Levels for the master, red, green and blue channels:
+    /// `[input black, input midtone, input white, output black, output white]` in 0..=1.
+    Levels(Vec<[f64; 5]>),
+    /// Gradient map stops: position 0..=1 and RGBA colour, sorted by position.
+    GradientMap(Vec<(f64, [f64; 4])>),
+}
+
+fn parse_correction(data: &[u8]) -> Option<Correction> {
+    let (kind, len) = (tile::int(data, 0)?, tile::int(data, 4)? as usize);
+    let body = data.get(8..8usize.checked_add(len)?)?;
+    let int = |i: usize| tile::int(body, i * 4).map(|v| f64::from(v as i32));
+    match kind {
+        1 => Some(Correction::BrightnessContrast(int(0)?.clamp(-100., 100.), int(1)?.clamp(-100., 100.))),
+        2 => {
+            // Ten-byte records of five u16 values; master first, then red, green and blue.
+            let records = (0..4).map(|k| {
+                let at = k * 10;
+                let word = |i: usize| body.get(at + i * 2..at + i * 2 + 2).map(|b| f64::from(u16::from_be_bytes([b[0], b[1]])) / 65535.);
+                Some([word(0)?, word(1)?, word(2)?, word(3)?, word(4)?])
+            }).collect::<Option<Vec<_>>>()?;
+            Some(Correction::Levels(records))
+        }
+        3 => {
+            // Four 1040-byte blocks (master, R, G, B): u16 point count, then u16 (x, y) pairs.
+            let curves = (0..4).map(|k| {
+                let block = body.get(k * 1040..k * 1040 + 1040)?;
+                let count = usize::from(u16::from_be_bytes([block[0], block[1]]));
+                if !(2..=256).contains(&count) { return None; }
+                let word = |at: usize| f64::from(u16::from_be_bytes([block[at], block[at + 1]])) / 65535.;
+                Some((0..count).map(|j| (word(2 + 4 * j), word(4 + 4 * j))).collect::<Vec<_>>())
+            }).collect::<Option<Vec<_>>>()?;
+            Some(Correction::ToneCurve(curves))
+        }
+        4 => Some(Correction::HueSaturation(int(0)?.clamp(-180., 180.), int(1)?.clamp(-100., 100.), int(2)?.clamp(-100., 100.))),
+        9 => {
+            // [size][header size][record size][count]...; records are
+            // [kind][R][G][B][A][flags][position 0..=32768], 16-bit colours stored twice per word.
+            let (header, record, count) = (tile::int(body, 4)? as usize, tile::int(body, 8)? as usize, tile::int(body, 12)? as usize);
+            if record < 28 || !(1..=256).contains(&count) { return None; }
+            let mut stops = (0..count).map(|k| {
+                let at = header.checked_add(k.checked_mul(record)?)?;
+                let word = |i: usize| tile::int(body, at + i * 4);
+                let colour = [1, 2, 3, 4].map(|i| word(i).map(|v| f64::from(v >> 16) / 65535.));
+                Some((f64::from(word(6)?) / 32768., [colour[0]?, colour[1]?, colour[2]?, colour[3]?]))
+            }).collect::<Option<Vec<_>>>()?;
+            stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+            Some(Correction::GradientMap(stops))
+        }
+        _ => None,
+    }
+}
+
+/// 8-bit lookup table of a natural cubic spline through the curve points.
+fn curve_lut(points: &[(f64, f64)]) -> [u8; 256] {
+    let mut pts: Vec<(f64, f64)> = points.to_vec();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9);
+    let n = pts.len();
+    let mut lut = [0u8; 256];
+    if n < 2 { for (i, v) in lut.iter_mut().enumerate() { *v = i as u8; } return lut; }
+    // Second derivatives (natural boundary) by the tridiagonal algorithm.
+    let mut second = vec![0f64; n];
+    let mut u = vec![0f64; n];
+    for i in 1..n - 1 {
+        let sig = (pts[i].0 - pts[i - 1].0) / (pts[i + 1].0 - pts[i - 1].0);
+        let p = sig * second[i - 1] + 2.;
+        second[i] = (sig - 1.) / p;
+        let d = (pts[i + 1].1 - pts[i].1) / (pts[i + 1].0 - pts[i].0) - (pts[i].1 - pts[i - 1].1) / (pts[i].0 - pts[i - 1].0);
+        u[i] = (6. * d / (pts[i + 1].0 - pts[i - 1].0) - sig * u[i - 1]) / p;
+    }
+    for i in (0..n - 1).rev() { second[i] = second[i] * second[i + 1] + u[i]; }
+    second[n - 1] = 0.;
+    for (i, out) in lut.iter_mut().enumerate() {
+        let x = i as f64 / 255.;
+        let y = if x <= pts[0].0 { pts[0].1 } else if x >= pts[n - 1].0 { pts[n - 1].1 } else {
+            let k = pts.windows(2).position(|w| x <= w[1].0).unwrap_or(n - 2);
+            let (a, b) = (pts[k], pts[k + 1]);
+            let h = b.0 - a.0;
+            let (ta, tb) = ((b.0 - x) / h, (x - a.0) / h);
+            ta * a.1 + tb * b.1 + ((ta.powi(3) - ta) * second[k] + (tb.powi(3) - tb) * second[k + 1]) * h * h / 6.
+        };
+        *out = (y.clamp(0., 1.) * 255.).round() as u8;
+    }
+    lut
+}
+
+fn hue_rgb(p: f64, q: f64, t: f64) -> f64 {
+    let t = t.rem_euclid(1.);
+    if t < 1. / 6. { p + (q - p) * 6. * t } else if t < 0.5 { q } else if t < 2. / 3. { p + (q - p) * (2. / 3. - t) * 6. } else { p }
+}
+
+/// The colours of `image` with a correction applied at full strength (alpha unchanged, except a
+/// gradient map's stop opacity). The caller blends it over the original with the layer's mode.
+fn corrected(image: &RgbaImage, correction: &Correction) -> RgbaImage {
+    let lut = |f: &dyn Fn(f64) -> f64| -> [u8; 256] { std::array::from_fn(|i| (f(i as f64 / 255.).clamp(0., 1.) * 255.).round() as u8) };
+    let mut output = image.clone();
+    match correction {
+        Correction::BrightnessContrast(brightness, contrast) => {
+            let (b, c) = (brightness / 100., contrast / 100.);
+            let slant = ((c + 1.) * std::f64::consts::FRAC_PI_4).tan();
+            let table = lut(&|v| (if b < 0. { v * (1. + b) } else { v + (1. - v) * b } - 0.5) * slant + 0.5);
+            for p in output.pixels_mut() { for ch in 0..3 { p[ch] = table[usize::from(p[ch])]; } }
+        }
+        Correction::ToneCurve(curves) => {
+            let master = curve_lut(&curves[0]);
+            let tables: [[u8; 256]; 3] = std::array::from_fn(|ch| {
+                let channel = curve_lut(&curves[ch + 1]);
+                std::array::from_fn(|i| master[usize::from(channel[i])])
+            });
+            for p in output.pixels_mut() { for ch in 0..3 { p[ch] = tables[ch][usize::from(p[ch])]; } }
+        }
+        Correction::Levels(records) => {
+            let level = |r: &[f64; 5]| -> [u8; 256] {
+                let [black, mid, white, out_black, out_white] = *r;
+                let range = (white - black).max(1e-6);
+                let middle = ((mid - black) / range).clamp(0.01, 0.99);
+                let exponent = 0.5f64.ln() / middle.ln();
+                lut(&|v| out_black + (out_white - out_black) * ((v - black) / range).clamp(0., 1.).powf(exponent))
+            };
+            let master = level(&records[0]);
+            let tables: [[u8; 256]; 3] = std::array::from_fn(|ch| {
+                let channel = level(&records[ch + 1]);
+                std::array::from_fn(|i| master[usize::from(channel[i])])
+            });
+            for p in output.pixels_mut() { for ch in 0..3 { p[ch] = tables[ch][usize::from(p[ch])]; } }
+        }
+        Correction::GradientMap(stops) => {
+            let table: [[u8; 4]; 256] = std::array::from_fn(|i| {
+                let x = i as f64 / 255.;
+                let k = stops.iter().position(|s| s.0 >= x).unwrap_or(stops.len());
+                let colour = if k == 0 { stops[0].1 } else if k == stops.len() { stops[k - 1].1 } else {
+                    let (a, b) = (stops[k - 1], stops[k]);
+                    let t = if b.0 > a.0 { (x - a.0) / (b.0 - a.0) } else { 1. };
+                    std::array::from_fn(|ch| a.1[ch] + (b.1[ch] - a.1[ch]) * t)
+                };
+                colour.map(|v| (v.clamp(0., 1.) * 255.).round() as u8)
+            });
+            for p in output.pixels_mut() {
+                let luma = (299 * u32::from(p[0]) + 587 * u32::from(p[1]) + 114 * u32::from(p[2]) + 500) / 1000;
+                let [r, g, b, a] = table[luma as usize];
+                *p = Rgba([r, g, b, ((u16::from(p[3]) * u16::from(a) + 127) / 255) as u8]);
+            }
+        }
+        Correction::HueSaturation(hue, saturation, luminosity) => {
+            let mut cache: HashMap<[u8; 3], [u8; 3]> = HashMap::new();
+            for p in output.pixels_mut() {
+                if p[3] == 0 { continue; }
+                let key = [p[0], p[1], p[2]];
+                let value = *cache.entry(key).or_insert_with(|| {
+                    let [r, g, b] = key.map(|v| f64::from(v) / 255.);
+                    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+                    let mut l = (max + min) / 2.;
+                    let mut s = if max == min { 0. } else if l > 0.5 { (max - min) / (2. - max - min) } else { (max - min) / (max + min) };
+                    let mut h = if max == min { 0. } else if max == r { ((g - b) / (max - min)).rem_euclid(6.) / 6. }
+                        else if max == g { ((b - r) / (max - min) + 2.) / 6. } else { ((r - g) / (max - min) + 4.) / 6. };
+                    h += hue / 360.;
+                    s = if *saturation < 0. { s * (1. + saturation / 100.) } else { s + (1. - s) * saturation / 100. };
+                    l = if *luminosity < 0. { l * (1. + luminosity / 100.) } else { l + (1. - l) * luminosity / 100. };
+                    let (s, l) = (s.clamp(0., 1.), l.clamp(0., 1.));
+                    let rgb = if s == 0. { [l; 3] } else {
+                        let q = if l < 0.5 { l * (1. + s) } else { l + s - l * s };
+                        let p = 2. * l - q;
+                        [hue_rgb(p, q, h + 1. / 3.), hue_rgb(p, q, h), hue_rgb(p, q, h - 1. / 3.)]
+                    };
+                    rgb.map(|v| (v.clamp(0., 1.) * 255.).round() as u8)
+                });
+                p[0] = value[0]; p[1] = value[1]; p[2] = value[2];
+            }
+        }
+    }
+    output
+}
+
+/// Recolours `target` like a CSP correction layer: the corrected copy is masked and blended back
+/// with the layer's blend mode and opacity, keeping the target's coverage.
+fn apply_correction(target: &mut RgbaImage, correction: &Correction, blend_mode: u8, strength: f64, mask: Option<&RgbaImage>) -> Result<()> {
+    let mut fixed = corrected(target, correction);
+    if let Some(mask) = mask {
+        for (pixel, m) in fixed.pixels_mut().zip(mask.pixels()) { pixel[3] = ((u16::from(pixel[3]) * u16::from(m[3]) + 127) / 255) as u8; }
+    }
+    blend(target, &fixed, blend_mode, strength, true)
+}
+
+/// Low-resolution stored layer thumbnail stretched over the canvas, for layers (such as 3D)
+/// without any independent pixel data. The thumbnail is drawn at the canvas aspect ratio.
+fn thumbnail_layer(source: &mut dyn ReadSeek, level: &Level, frame: Frame<'_>) -> Result<RgbaImage> {
+    let canvas = (level.geometry.width, level.geometry.height);
+    let image = tile::read(source, level, canvas, Placement { canvas, offset: (0., 0.), color: [0; 3] }, false)?;
+    let ratio = f64::from(frame.native.0) / f64::from(frame.native.1.max(1));
+    let (w, h) = (f64::from(image.width()), f64::from(image.height()));
+    let (cw, ch) = if w / h > ratio { ((h * ratio).round().max(1.), h) } else { (w, (w / ratio).round().max(1.)) };
+    let (left, top) = (((w - cw) / 2.).floor() as u32, ((h - ch) / 2.).floor() as u32);
+    let cropped = image::imageops::crop_imm(&image, left, top, cw as u32, ch as u32).to_image();
+    Ok(image::imageops::resize(&cropped, frame.size.0, frame.size.1, image::imageops::FilterType::Triangle))
+}
+
 #[derive(Clone)]
-struct TextSprite { level: Level, x: i32, y: i32 }
+/// A text object's stored render; `color` tints alpha-only caches (the object's own text colour).
+/// `x`/`y` are canvas pixels, or offsets from the centre of balloon shape `anchor` when the text
+/// bounds are stored relative to their balloon (the n-th such text belongs to the n-th shape).
+struct TextSprite { level: Level, x: i32, y: i32, color: Option<[u8; 3]>, anchor: Option<usize> }
 
 struct Node {
     id: i64,
@@ -383,8 +653,17 @@ struct Node {
     vectors: Vec<(u64, Vec<u8>)>,
     /// Frame folder whose closed vector paths mask its contents to panels.
     panel_mask: bool,
+    /// Translation applied to this frame folder's vector paths.
+    vector_shift: (f64, f64),
     tone: Option<Tone>,
     fill: Option<Fill>,
+    /// Image material: destination corners (top-left, top-right, bottom-left, bottom-right)
+    /// of the original image (`object` levels) in canvas pixels.
+    resizable: Option<[(f64, f64); 4]>,
+    correction: Option<Correction>,
+    preview_color: Option<PreviewColor>,
+    /// "Layer colour" display: dark pixels take this colour, white stays white.
+    layer_color: Option<[u8; 3]>,
     detail: Value,
     can_render: bool,
     folder: bool,
@@ -466,7 +745,7 @@ fn load_storage(db: &Connection) -> Result<Storage> {
             )
             SELECT VectorObjectList.LayerId, chunks.IdBytes, chunks.Offset
             FROM VectorObjectList JOIN chunks ON CAST(VectorObjectList.VectorData AS BLOB) = chunks.IdBytes
-            LIMIT 200001")
+            ORDER BY VectorObjectList.MainId LIMIT 200001")
     {
         let mut rows = statement.query([]).map_err(error)?;
         let mut count = 0;
@@ -653,7 +932,7 @@ fn attrs(mut bytes: &[u8]) -> Value {
     result
 }
 
-fn text_objects(row: &LayerRow<'_, '_>, store: &Storage, id: i64) -> (Vec<Value>, Vec<TextSprite>, usize) {
+fn text_objects(row: &LayerRow<'_, '_>, store: &Storage, id: i64, balloon: bool) -> (Vec<Value>, Vec<TextSprite>, usize) {
     let strings = prefixed(row.blob("TextLayerStringArray"));
     let attributes = prefixed(row.blob("TextLayerAttributesArray"));
     let extended = prefixed(row.blob("TextLayerAddAttributesV01"));
@@ -669,11 +948,13 @@ fn text_objects(row: &LayerRow<'_, '_>, store: &Storage, id: i64) -> (Vec<Value>
         if let Some(level) = cache.and_then(|id| store.levels.get(&id)).filter(|level| level.owner == id)
             && let Some(bounds) = bounds
         {
-            sprites.push(TextSprite {
-                level: level.clone(),
-                x: bounds.first().and_then(Value::as_i64).unwrap_or_default() as i32,
-                y: bounds.get(1).and_then(Value::as_i64).unwrap_or_default() as i32,
-            });
+            let color = attributes["color"].as_array().or_else(|| extended["color"].as_array())
+                .and_then(|c| (c.len() == 3).then(|| [0, 1, 2].map(|i| c[i].as_u64().unwrap_or(0).min(255) as u8)));
+            let edge = |i: usize| bounds.get(i).and_then(Value::as_i64).unwrap_or_default() as i32;
+            // Balloon texts may keep bounds around their balloon's centre instead of the canvas.
+            let relative = balloon && edge(0) < 0 && edge(2) > 0 && edge(1) < 0 && edge(3) > 0;
+            let anchor = relative.then(|| sprites.iter().filter(|s: &&TextSprite| s.anchor.is_some()).count());
+            sprites.push(TextSprite { color, level: level.clone(), x: edge(0), y: edge(1), anchor });
         } else if !text.is_empty() { missing += 1; }
         texts.push(json!({"index": texts.len(), "text": text, "attributes": attributes, "extendedAttributes": extended}));
     };
@@ -740,21 +1021,30 @@ fn decode_layer(row: &LayerRow<'_, '_>, store: &Storage) -> Node {
     let offset = (n("LayerOffsetX"), n("LayerOffsetY"));
     let render_offset = (n("LayerRenderOffscrOffsetX"), n("LayerRenderOffscrOffsetY"));
     let mask_offset = (offset.0 + n("LayerMaskOffsetX") + n("LayerMaskOffscrOffsetX"), offset.1 + n("LayerMaskOffsetY") + n("LayerMaskOffscrOffsetY"));
+    // Panel paths of a moved frame folder keep their original coordinates; the move is stored
+    // as the mask offset (its offscreen offset only compensates the raster mask buffer).
+    let vector_shift = (offset.0 + n("LayerMaskOffsetX"), offset.1 + n("LayerMaskOffsetY"));
     let raster = store.chain(i("LayerRenderMipmap"));
     let object = store.chain(i("ResizableOriginalMipmap"));
+    let resizable = resizable_corners(row.blob("ResizableImageInfo")).filter(|_| !object.is_empty());
     let mask = store.chain(i("LayerLayerMaskMipmap"));
     let thumb = store.thumb_ids.get(&i("LayerRenderThumbnail")).and_then(|id| store.levels.get(id)).cloned();
-    let (texts, sprites, missing) = if text { text_objects(row, store, id) } else { (vec![], vec![], 0) };
+    let (texts, sprites, missing) = if text { text_objects(row, store, id, balloon) } else { (vec![], vec![], 0) };
     let info = row.blob("LayerEffectInfo");
     let edge = effect(info, "EffectEdge").and_then(|(_, bytes)| {
         let width = tile::double(bytes, 4)?;
         let color = [12, 16, 20].map(|i| color_channel(tile::int(bytes, i).unwrap_or_default() as f64));
-        (width > 0. && width <= 10_000. && bytes.len() >= 24).then_some(Edge { width, color })
+        // The first word is the on/off switch of the layer property.
+        let enabled = tile::int(bytes, 0)? != 0;
+        (enabled && width > 0. && width <= 10_000. && bytes.len() >= 24).then_some(Edge { width, color })
     });
     let tone = effect(info, "EffectTone").and_then(|(_, bytes)| {
         let frequency = tile::double(bytes, 24)?;
         (frequency > 0. && frequency <= 1000.).then_some(Tone {
             frequency, angle: tile::int(bytes, 40)?, resolution: tile::double(bytes, 4)?,
+            enabled: tile::int(bytes, 0)? != 0,
+            kind: tile::int(bytes, 12)?, source: tile::int(bytes, 16)?,
+            density: f64::from(tile::int(bytes, 20)?.min(100)) / 100.,
         })
     });
     let mut effects = Vec::new();
@@ -762,23 +1052,37 @@ fn decode_layer(row: &LayerRow<'_, '_>, store: &Storage) -> Node {
     if tone.is_some() { effects.push("톤"); }
     if filter { effects.push("필터 효과"); }
     if effects.is_empty() && i("LayerEffectAttached") != 0 { effects.push("레이어 효과"); }
+    let preview_color = (i("UsePreviewColorType") == 1 && matches!(i("PreviewColorTypeIndex"), 1 | 2)).then(|| PreviewColor {
+        monochrome: i("PreviewColorTypeIndex") == 2,
+        black: i("PreviewColorTypeBlackChecked") != 0, white: i("PreviewColorTypeWhiteChecked") != 0,
+        threshold: n("PreviewColorTypeThresholdImage") / f64::from(u32::MAX),
+        alpha_threshold: n("PreviewColorTypeThresholdAlpha") / f64::from(u32::MAX),
+    });
     let matching_mask = flags & 2 == 0 || i("LayerLayerMaskMipmap") == 0 || !mask.is_empty();
     let has_mask = i("LayerLayerMaskMipmap") != 0 || i("LayerLayerMaskThumbnail") != 0;
-    let vectors = store.vectors.get(&id).cloned().unwrap_or_default();
+    let mut vectors = store.vectors.get(&id).cloned().unwrap_or_default();
+    // A frame folder can keep superseded panel layouts; CSP draws only the newest one.
+    if folder && frame && vectors.len() > 1 { vectors.drain(..vectors.len() - 1); }
     let panel_mask = folder && has_mask && flags & 2 != 0 && !vectors.is_empty();
     // Text without a stored layer raster needs every object's render cache (no font fallback yet).
     let text_ready = !text || !raster.is_empty() || missing == 0;
     // Tone is reproduced on non-raster sources and groups, as in the reference renderer.
-    let renderable = (kind == "paper" || !raster.is_empty() || fill.is_some() || !vectors.is_empty()
+    let correction = if filter { parse_correction(row.blob("FilterLayerInfo")).or_else(|| parse_correction(row.blob("FilterLayerV132"))) } else { None };
+    let renderable = (kind == "paper" || !raster.is_empty() || fill.is_some() || !vectors.is_empty() || resizable.is_some()
+        || correction.is_some() || (!filter && thumb.is_some())
         || (text && !sprites.is_empty()))
-        && text_ready && !filter && (!frame || !raster.is_empty() || !vectors.is_empty()) && matching_mask
-        && !(kind == "object" && raster.is_empty());
+        && text_ready && (!filter || correction.is_some()) && (!frame || !raster.is_empty() || !vectors.is_empty()) && matching_mask
+        && !(kind == "object" && raster.is_empty() && resizable.is_none());
     let storage_info = |levels: &[Level]| levels.iter().max_by_key(|level| level.geometry.pixels()).map(|level|
         json!({"width": level.geometry.width, "height": level.geometry.height, "levels": levels.len()}));
+    // CSP leaves story information and page numbers out of its canvas preview, so they start
+    // hidden here; they can still be switched on.
+    let preview_hidden = matches!(subtype, "story-information" | "page-number");
+    let visible = flags & 1 != 0 && !preview_hidden;
     let details = json!({
         "id": id.to_string(), "type": kind, "kind": subtype, "typeLabel": label,
         "classificationSource": "CLIP 레이어 종류 및 저장 데이터",
-        "layerTypeCode": code, "folderKind": i("LayerFolder"), "visible": flags & 1 != 0,
+        "layerTypeCode": code, "folderKind": i("LayerFolder"), "visible": visible, "previewHidden": preview_hidden && flags & 1 != 0,
         "maskVisible": flags & 2 != 0, "rulerVisible": flags & 4 != 0, "locked": lock & 1 != 0,
         "alphaLocked": lock & 16 != 0, "lockFlags": lock, "draft": i("DraftLayer") != 0,
         "opacity": (opacity * 100.).round(), "opacityExact": opacity * 100.,
@@ -814,10 +1118,13 @@ fn decode_layer(row: &LayerRow<'_, '_>, store: &Storage) -> Node {
     Node {
         id, first: i("LayerFirstChildIndex"), next: i("LayerNextIndex"), child: vec![],
         name: if name.is_empty() { if folder { "그룹".into() } else { "이름 없는 레이어".into() } } else { name },
-        kind, visible: flags & 1 != 0, mask_visible: flags & 2 != 0, opacity, blend,
+        kind, visible, mask_visible: flags & 2 != 0, opacity, blend,
         clipping: i("LayerClip") != 0, offset, render_offset, mask_offset,
-        color, raster, object, mask, thumb, sprites, texts, edge, vectors, panel_mask, tone, fill, detail: details,
-        can_render: if folder { (!frame || panel_mask) && !filter && matching_mask } else { renderable },
+        color, raster, object, mask, thumb, sprites, texts, edge, vectors, panel_mask, vector_shift: if folder && frame { vector_shift } else { offset }, tone, fill, resizable, correction, preview_color,
+        layer_color: (i("DrawColorEnable") != 0 && !folder && kind != "paper").then_some(color), detail: details,
+        // A frame folder without panel paths still composes its children and raster mask.
+        // Frame folders often keep their panel mask only as vector paths (no raster mask level).
+        can_render: if folder { !filter && (matching_mask || panel_mask) } else { renderable },
         folder,
     }
 }
@@ -844,8 +1151,13 @@ fn build_tree(nodes: &mut HashMap<i64, Node>, mut id: i64, depth: u32) -> Result
     Ok(tree)
 }
 
+fn depth(nodes: &[Node]) -> u64 {
+    nodes.iter().map(|n| if n.folder { 1 + depth(&n.child) } else { 0 }).max().unwrap_or(0)
+}
+
 pub struct Document {
     pub preview: Vec<u8>,
+    preview_size: (u32, u32),
     pub crop: Option<Crop>,
     size: (u32, u32),
     native: (u32, u32),
@@ -885,29 +1197,41 @@ impl Document {
                 nodes.insert(layer.id, layer);
             }
         }
-        let physical = ((canvas.width / 25.4 * dpi).round() as u32, (canvas.height / 25.4 * dpi).round() as u32);
-        let physical_ratio = physical.0 as f64 / physical.1.max(1) as f64;
+        // The canvas size is stored in its document unit: 0 px, 1 cm, 2 mm, 3 inch, 4 pt.
+        let per_unit = match canvas.unit { 0 => Some(1.), 1 => Some(dpi / 2.54), 2 => Some(dpi / 25.4), 3 => Some(dpi), 4 => Some(dpi / 72.), _ => None };
+        let physical = per_unit.map(|k| ((canvas.width * k).round() as u32, (canvas.height * k).round() as u32));
+        let preview_size = size;
         let ratio = size.0 as f64 / size.1 as f64;
-        let native = if canvas.unit == 2 && physical.0 != 0 && physical.1 != 0 && (physical_ratio - ratio).abs() <= 0.02_f64.max(ratio * 0.03) {
-            physical
-        } else {
+        let trusted = physical.filter(|p| p.0 != 0 && p.1 != 0
+            && (p.0 as f64 / p.1 as f64 - ratio).abs() <= 0.02_f64.max(ratio * 0.03));
+        let native = trusted.unwrap_or_else(|| {
             nodes.values().flat_map(|n| &n.raster).map(|level| level.geometry)
                 .max_by_key(|geometry| geometry.pixels()).map_or(size, |g| (g.width, g.height))
-        };
+        });
         let root_start = nodes.remove(&canvas.root).map_or(0, |root| root.first);
         let mut tree = build_tree(&mut nodes, root_start, 0)?;
         if tree.is_empty() { tree = order.into_iter().rev().filter_map(|id| nodes.remove(&id)).collect(); }
+        // Compose at the real canvas resolution (halved while over budget), not the small preview.
+        let size = match trusted {
+            Some(native) => {
+                let depth = depth(&tree);
+                let mut display = native;
+                while u64::from(display.0) * u64::from(display.1) > MAX_DISPLAY_PIXELS
+                    || u64::from(display.0) * u64::from(display.1) * 4 * (7 + depth * 2) > MAX_COMPOSITE_BYTES
+                { display = (display.0.div_ceil(2), display.1.div_ceil(2)); }
+                display
+            }
+            None => preview_size,
+        };
         let tips = store.tip_images.iter().map(|(&id, &mipmap)| (id, store.chain(mipmap))).filter(|(_, levels)| !levels.is_empty()).collect();
         let brushes = std::rc::Rc::new(Brushes { styles: store.brushes, tips, cache: RefCell::default() });
-        Ok(Self { preview, crop: canvas.crop, size, native, dpi, nodes: tree, brushes, source })
+        Ok(Self { preview, preview_size, crop: canvas.crop, size, native, dpi, nodes: tree, brushes, source })
     }
 
-    pub fn dimensions(&self) -> Result<(u32, u32)> { Ok(self.size) }
+    /// Size of the stored CSP preview image.
+    pub fn dimensions(&self) -> Result<(u32, u32)> { Ok(self.preview_size) }
 
     fn compositing_supported(&self) -> bool {
-        fn depth(nodes: &[Node]) -> u64 {
-            nodes.iter().map(|n| if n.folder { 1 + depth(&n.child) } else { 0 }).max().unwrap_or(0)
-        }
         u64::from(self.size.0) * u64::from(self.size.1) * 4 * (7 + depth(&self.nodes) * 2) <= MAX_COMPOSITE_BYTES
     }
 
@@ -1011,15 +1335,25 @@ fn strokes(source: &mut dyn ReadSeek, node: &Node, frame: Frame<'_>) -> Result<V
     let mut budget = vector::MAX_POINTS;
     let mut strokes = Vec::new();
     for (offset, id) in &node.vectors {
-        strokes.extend(vector::decode(&tile::chunk(source, *offset, id)?, frame.native, &frame.brushes.styles, &mut budget));
+        strokes.extend(vector::decode(&tile::chunk(source, *offset, id)?, frame.native, node.vector_shift, &frame.brushes.styles, &mut budget));
         if budget == 0 { break; }
+    }
+    let (dx, dy) = node.vector_shift;
+    if dx != 0. || dy != 0. {
+        for point in strokes.iter_mut().flat_map(|stroke| stroke.points.iter_mut()) {
+            point.x += dx;
+            point.y += dy;
+            for handle in &mut point.handles { handle.0 += dx; handle.1 += dy; }
+        }
     }
     Ok(strokes)
 }
 
 impl Node {
+    /// Folders can be toggled when anything inside them is drawn; children without independent
+    /// data are omitted from the composite either way, so hiding the folder stays consistent.
     fn toggleable(&self) -> bool {
-        self.can_render && (!self.folder || (!self.child.is_empty() && self.child.iter().all(Node::toggleable)))
+        self.can_render && (!self.folder || self.has_source() || self.child.iter().any(Node::toggleable))
     }
 
     fn shown(&self, overrides: &Value) -> bool {
@@ -1028,6 +1362,8 @@ impl Node {
 
     fn has_source(&self) -> bool {
         self.kind == "paper" || !self.raster.is_empty() || self.fill.is_some() || !self.vectors.is_empty() || !self.sprites.is_empty()
+            || self.resizable.is_some() || self.correction.is_some()
+            || (!self.folder && self.thumb.is_some() && self.detail["kind"] != "correction")
     }
 }
 
@@ -1067,6 +1403,8 @@ fn leaf(source: &mut dyn ReadSeek, node: &Node, frame: Frame<'_>) -> Result<Opti
         let [r, g, b] = node.color;
         return Ok(Some(RgbaImage::from_pixel(size.0, size.1, Rgba([r, g, b, 255]))));
     }
+    // Fill and gradient layers are defined by their settings; a stored raster can be stale.
+    if node.vectors.is_empty() && let Some(fill) = &node.fill { return Ok(Some(render_fill(fill, size, native))); }
     if let Some(level) = nearest(&node.raster, size) {
         return tile::read(source, level, size, Placement {
             canvas: native,
@@ -1074,15 +1412,37 @@ fn leaf(source: &mut dyn ReadSeek, node: &Node, frame: Frame<'_>) -> Result<Opti
             offset: (node.offset.0 + node.render_offset.0, node.offset.1 + node.render_offset.1),
         }, false).map(Some);
     }
+    if let Some(corners) = node.resizable { return image_material(source, node, corners, frame).map(Some); }
     // Vector shapes come before fills; a balloon also owns text objects drawn on top of them.
     let shapes = if node.vectors.is_empty() { None } else { vector_image(source, node, frame)? };
     if shapes.is_none() && let Some(fill) = &node.fill { return Ok(Some(render_fill(fill, size, native))); }
-    if node.sprites.is_empty() { return Ok(shapes); }
+    if node.sprites.is_empty() {
+        if shapes.is_none() && !node.folder && node.correction.is_none() && let Some(thumb) = &node.thumb {
+            return thumbnail_layer(source, thumb, frame).map(Some);
+        }
+        return Ok(shapes);
+    }
     let mut output = shapes.unwrap_or_else(|| RgbaImage::new(size.0, size.1));
+    let centres: Vec<(f64, f64)> = if node.sprites.iter().any(|s| s.anchor.is_some()) {
+        strokes(source, node, frame)?.iter().filter_map(|stroke| {
+            let (mut l, mut t, mut r, mut b) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for p in &stroke.points { l = l.min(p.x); t = t.min(p.y); r = r.max(p.x); b = b.max(p.y); }
+            (l <= r).then_some(((l + r) / 2., (t + b) / 2.))
+        }).collect()
+    } else { Vec::new() };
     for sprite in &node.sprites {
+        let origin = match sprite.anchor {
+            // Shapes pair with relative texts in order; extra texts use the middle of all shapes.
+            Some(index) if index < centres.len() => centres[index],
+            Some(_) if !centres.is_empty() => {
+                let n = centres.len() as f64;
+                (centres.iter().map(|c| c.0).sum::<f64>() / n, centres.iter().map(|c| c.1).sum::<f64>() / n)
+            }
+            _ => node.offset,
+        };
         let glyphs = tile::read_sprite(source, &sprite.level, size, Placement {
-            canvas: native, color: node.color,
-            offset: (node.offset.0 + f64::from(sprite.x), node.offset.1 + f64::from(sprite.y)),
+            canvas: native, color: sprite.color.unwrap_or(node.color),
+            offset: (origin.0 + f64::from(sprite.x), origin.1 + f64::from(sprite.y)),
         })?;
         if let Some((glyphs, origin)) = glyphs { blend_at(&mut output, &glyphs, origin)?; }
     }
@@ -1138,6 +1498,73 @@ fn dilate(input: &[u8], width: usize, height: usize, radius: usize, vertical: bo
     output
 }
 
+/// `ResizableImageInfo`: destination corners of an image material (reference `parseClipResizableImage`).
+fn resizable_corners(data: &[u8]) -> Option<[(f64, f64); 4]> {
+    if data.len() < 184 { return None; }
+    let (w, h) = (tile::int(data, 32)?, tile::int(data, 36)?);
+    if w == 0 || h == 0 || w > 100_000 || h > 100_000 { return None; }
+    let corner = |at: usize| Some((tile::double(data, at)?, tile::double(data, at + 8)?));
+    Some([corner(120)?, corner(136)?, corner(152)?, corner(168)?])
+}
+
+/// Draws an image material's original through its affine placement with bilinear sampling.
+fn image_material(source: &mut dyn ReadSeek, node: &Node, corners: [(f64, f64); 4], frame: Frame<'_>) -> Result<RgbaImage> {
+    let Frame { size, native, .. } = frame;
+    let scale = (size.0 as f64 / native.0.max(1) as f64, size.1 as f64 / native.1.max(1) as f64);
+    let points = corners.map(|(x, y)| (x * scale.0, y * scale.1));
+    let (min_x, max_x) = points.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.0), b.max(p.0)));
+    let (min_y, max_y) = points.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.1), b.max(p.1)));
+    // Decode near the size the material covers on screen.
+    let target = ((max_x - min_x).max(max_y - min_y) * 1.5).ceil().clamp(64., 4096.) as u32;
+    let level = {
+        let mut levels: Vec<&Level> = node.object.iter().collect();
+        levels.sort_by_key(|l| l.geometry.pixels());
+        levels.iter().find(|l| l.geometry.width.max(l.geometry.height) >= target * 2).or(levels.last()).copied()
+            .ok_or("이미지 소재 원본이 없습니다.")?
+    };
+    let canvas = (level.geometry.width, level.geometry.height);
+    let decoded = tile::read(source, level, fit(canvas, target), Placement { canvas, offset: (0., 0.), color: node.color }, false)?;
+    let (dw, dh) = (f64::from(decoded.width()), f64::from(decoded.height()));
+    let [top_left, top_right, bottom_left, _] = points;
+    // Columns of the source-to-canvas matrix, per decoded pixel.
+    let (a, b) = ((top_right.0 - top_left.0) / dw, (top_right.1 - top_left.1) / dw);
+    let (c, d) = ((bottom_left.0 - top_left.0) / dh, (bottom_left.1 - top_left.1) / dh);
+    let det = a * d - b * c;
+    let mut output = RgbaImage::new(size.0, size.1);
+    if det.abs() < 1e-12 { return Ok(output); }
+    let x0 = min_x.floor().max(0.) as u32;
+    let y0 = min_y.floor().max(0.) as u32;
+    let x1 = (max_x.ceil().max(0.) as u32).min(size.0);
+    let y1 = (max_y.ceil().max(0.) as u32).min(size.1);
+    let raw = decoded.as_raw();
+    let (iw, ih) = (decoded.width() as i64, decoded.height() as i64);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (px, py) = (x as f64 + 0.5 - top_left.0, y as f64 + 0.5 - top_left.1);
+            let u = (d * px - c * py) / det - 0.5;
+            let v = (-b * px + a * py) / det - 0.5;
+            if u < -0.5 || v < -0.5 || u > dw - 0.5 || v > dh - 0.5 { continue; }
+            let (ix, iy) = (u.floor() as i64, v.floor() as i64);
+            let (fx, fy) = (u - ix as f64, v - iy as f64);
+            let mut sum = [0f64; 4];
+            for (dy, wy) in [(0, 1. - fy), (1, fy)] {
+                for (dx, wx) in [(0, 1. - fx), (1, fx)] {
+                    let (sx, sy) = ((ix + dx).clamp(0, iw - 1), (iy + dy).clamp(0, ih - 1));
+                    let p = &raw[((sy * iw + sx) * 4) as usize..][..4];
+                    let weight = wx * wy;
+                    let alpha = f64::from(p[3]) * weight;
+                    for ch in 0..3 { sum[ch] += f64::from(p[ch]) * alpha; }
+                    sum[3] += alpha;
+                }
+            }
+            if sum[3] <= 0. { continue; }
+            let px = [sum[0] / sum[3], sum[1] / sum[3], sum[2] / sum[3], sum[3]].map(|v| v.round().clamp(0., 255.) as u8);
+            output.put_pixel(x, y, Rgba(px));
+        }
+    }
+    Ok(output)
+}
+
 fn apply_properties(source: &mut dyn ReadSeek, layer: &Node, image: &mut RgbaImage, frame: Frame<'_>) -> Result<()> {
     let Frame { size, native, dpi, .. } = frame;
     if let Some(edge) = layer.edge {
@@ -1165,9 +1592,16 @@ fn apply_properties(source: &mut dyn ReadSeek, layer: &Node, image: &mut RgbaIma
             }
         }
     }
+    if let Some(mode) = layer.preview_color { apply_preview_color(image, mode); }
+    if let Some(tint) = layer.layer_color {
+        for p in image.pixels_mut().filter(|p| p[3] != 0) {
+            let light = (299 * u32::from(p[0]) + 587 * u32::from(p[1]) + 114 * u32::from(p[2]) + 500) / 1000;
+            for ch in 0..3 { p[ch] = ((u32::from(tint[ch]) * (255 - light) + 255 * light + 127) / 255) as u8; }
+        }
+    }
     // A stored layer raster already reflects CSP's own tone processing; groups and
     // reconstructed sources (fills, paper, text objects) do not.
-    if let Some(tone) = layer.tone && (layer.folder || layer.raster.is_empty()) {
+    if let Some(tone) = layer.tone && tone.enabled && (layer.folder || layer.raster.is_empty()) {
         apply_tone(image, tone, size, native, dpi);
     }
     if layer.mask_visible && let Some(level) = nearest(&layer.mask, size) {
@@ -1204,10 +1638,25 @@ fn compose_into(source: &mut dyn ReadSeek, layers: &[Node], frame: Frame<'_>, ov
         if let Some((img, op, strength)) = base.take() { blend(result, &img, op, strength, false)?; }
         Ok(())
     };
-    for layer in layers.iter().rev() {
+    for (index, layer) in layers.iter().enumerate().rev() {
         if !layer.clipping { flush(&mut base, result)?; }
+        // Layers clipped to this one need it as an isolated base image.
+        let clip_base = index > 0 && layers[index - 1].clipping && !layer.clipping;
         if !layer.shown(overrides) { continue; }
-        if layer.folder && layer.blend == 30 && !layer.clipping && layer.opacity == 1.
+        // A correction layer recolours what is beneath it in its scope (or its clipping base).
+        if let (Some(correction), false) = (&layer.correction, layer.folder) {
+            let mask = match nearest(&layer.mask, frame.size).filter(|_| layer.mask_visible) {
+                Some(level) => Some(tile::read(source, level, frame.size, Placement { canvas: frame.native, color: [0; 3], offset: layer.mask_offset }, true)?),
+                None => None,
+            };
+            if layer.clipping {
+                if let Some((base_image, _, _)) = &mut base { apply_correction(base_image, correction, layer.blend, layer.opacity, mask.as_ref())?; }
+            } else {
+                apply_correction(result, correction, layer.blend, layer.opacity, mask.as_ref())?;
+            }
+            continue;
+        }
+        if layer.folder && layer.blend == 30 && !layer.clipping && !clip_base && layer.opacity == 1.
             && layer.mask.is_empty() && layer.edge.is_none() && layer.tone.is_none()
             && layer.raster.is_empty() && layer.fill.is_none() && layer.vectors.is_empty()
         {
@@ -1270,7 +1719,7 @@ pub fn thumbnail(assets: &Assets, item: &Item, id: &str) -> Result<Value> {
 
 /// Renders the requested visibility from separated layers. The stored CSP preview is never
 /// used as a base, so hidden layers leave no residue from the merged image.
-pub fn render(assets: &Assets, item: &Item, overrides: &Value) -> Result<Value> {
+pub fn render(assets: &Assets, item: &Item, overrides: &Value, mode: &str) -> Result<Value> {
     only_clip(item)?;
     let mut doc = Document::read(item)?;
     if !doc.compositing_supported() { return Err("CLIP 레이어 합성 크기가 안전 제한을 초과합니다.".into()); }
@@ -1280,7 +1729,13 @@ pub fn render(assets: &Assets, item: &Item, overrides: &Value) -> Result<Value> 
     let brushes = std::rc::Rc::clone(&doc.brushes);
     let frame = doc.frame(&brushes);
     let image = compose(&mut *doc.source, &doc.nodes, frame, overrides)?;
-    picture::rendered(assets, item, image, doc.description(), "CLIP 레이어 합성")
+    // Keep the trim/bleed view chosen by the viewer after a toggle.
+    let area = doc.crop.clone().or_else(|| item.crop());
+    let image = match area.as_ref().and_then(|c| picture::crop_rect(c, mode, image.width(), image.height())) {
+        Some([l, t, r, b]) => image::imageops::crop_imm(&image, l, t, r - l, b - t).to_image(),
+        None => image,
+    };
+    picture::rendered_area(assets, item, image, doc.description(), "CLIP 레이어 합성", area.is_some())
 }
 
 pub fn prepare(item: &Item) -> Result<Value> {
@@ -1292,9 +1747,15 @@ pub fn prepare(item: &Item) -> Result<Value> {
     Ok(json!(true))
 }
 
-pub fn pick(item: &Item, x: f64, y: f64, overrides: &Value) -> Result<Value> {
+pub fn pick(item: &Item, x: f64, y: f64, overrides: &Value, mode: &str) -> Result<Value> {
     only_clip(item)?;
     let mut doc = Document::read(item)?;
+    // Points arrive in the displayed (possibly trimmed) image; move them to canvas pixels.
+    let area = doc.crop.clone().or_else(|| item.crop());
+    let (x, y) = match area.as_ref().and_then(|c| picture::crop_rect(c, mode, doc.size.0, doc.size.1)) {
+        Some([l, t, ..]) => (x + f64::from(l), y + f64::from(t)),
+        None => (x, y),
+    };
     if !x.is_finite() || !y.is_finite() || x < 0. || y < 0. || x >= doc.size.0 as f64 || y >= doc.size.1 as f64 {
         return Ok(Value::Null);
     }
@@ -1422,7 +1883,7 @@ mod tests {
 
     #[test]
     fn tone_turns_coverage_into_black_halftone_dots() {
-        let tone = Tone { frequency: 10., angle: 45, resolution: 100. };
+        let tone = Tone { frequency: 10., angle: 45, resolution: 100., enabled: true, kind: 1, source: 0, density: 0.2 };
         let mut solid = RgbaImage::from_pixel(40, 40, Rgba([0, 0, 0, 255]));
         apply_tone(&mut solid, tone, (40, 40), (40, 40), 72.);
         let coverage = solid.pixels().map(|p| f64::from(p[3]) / 255.).sum::<f64>() / 1600.;
@@ -1435,6 +1896,65 @@ mod tests {
         let mut clear = RgbaImage::new(4, 4);
         apply_tone(&mut clear, tone, (4, 4), (4, 4), 72.);
         assert!(clear.pixels().all(|p| p.0 == [0; 4]));
+    }
+
+    #[test]
+    fn tone_area_follows_density_linearly_and_set_density_ignores_brightness() {
+        let tone = Tone { frequency: 10., angle: 45, resolution: 400., enabled: true, kind: 1, source: 0, density: 0.2 };
+        let coverage = |image: &RgbaImage| image.pixels().map(|p| f64::from(p[3]) / 255.).sum::<f64>() / f64::from(image.width() * image.height());
+        for (grey, expected) in [(191u8, 0.25), (64, 0.75)] {
+            let mut image = RgbaImage::from_pixel(200, 200, Rgba([grey, grey, grey, 255]));
+            apply_tone(&mut image, tone, (200, 200), (200, 200), 72.);
+            assert!((coverage(&image) - expected).abs() < 0.04, "{grey}: {}", coverage(&image));
+        }
+        let mut light = RgbaImage::from_pixel(200, 200, Rgba([230, 230, 230, 255]));
+        apply_tone(&mut light, Tone { source: 2, ..tone }, (200, 200), (200, 200), 72.);
+        assert!((coverage(&light) - 0.2).abs() < 0.04, "{}", coverage(&light));
+    }
+
+    #[test]
+    fn parses_levels_and_gradient_map_corrections() {
+        let mut levels = vec![0, 0, 0, 2, 0, 0, 0, 40];
+        for record in [[0x1134u16, 0x8899, 0xffff, 0, 0xffff], [0, 0x7fff, 0xffff, 0, 0xffff], [0, 0x7fff, 0xffff, 0, 0xffff], [0, 0x7fff, 0xffff, 0, 0xffff]] {
+            for v in record { levels.extend(v.to_be_bytes()); }
+        }
+        let Some(Correction::Levels(records)) = parse_correction(&levels) else { panic!("levels") };
+        assert!((records[0][0] - 0x1134 as f64 / 65535.).abs() < 1e-9 && records[1][1] > 0.49);
+        let image = RgbaImage::from_pixel(1, 1, Rgba([0x11, 0x11, 0x11, 255]));
+        assert!(corrected(&image, &Correction::Levels(records)).get_pixel(0, 0)[0] <= 1);
+
+        let word = |v: u32| v.to_be_bytes();
+        let mut body = Vec::new();
+        for v in [0u32, 24, 28, 2, 16, 0] { body.extend(word(v)); }
+        for (kind, colour, position) in [(3u32, 0x0000_0000u32, 0u32), (0, 0xffff_ffff, 0x8000)] {
+            body.extend(word(kind));
+            for _ in 0..3 { body.extend(word(colour)); }
+            body.extend(word(0xffff_ffff));
+            body.extend(word(0));
+            body.extend(word(position));
+        }
+        let mut data = word(9).to_vec();
+        data.extend(word(body.len() as u32));
+        data.extend(body);
+        let Some(Correction::GradientMap(stops)) = parse_correction(&data) else { panic!("gradient map") };
+        assert_eq!(stops.len(), 2);
+        // Black-to-white map keeps luminance; the alpha of the target is preserved.
+        let grey = RgbaImage::from_pixel(1, 1, Rgba([10, 200, 30, 128]));
+        let out = corrected(&grey, &Correction::GradientMap(stops));
+        let luma = (299 * 10 + 587 * 200 + 114 * 30 + 500) / 1000;
+        assert_eq!(out.get_pixel(0, 0).0, [luma as u8, luma as u8, luma as u8, 128]);
+    }
+
+    #[test]
+    fn preview_colour_converts_to_grey_or_thresholded_monochrome() {
+        let mut image = RgbaImage::from_pixel(2, 1, Rgba([200, 40, 40, 255]));
+        image.put_pixel(1, 0, Rgba([250, 250, 250, 255]));
+        let mut grey = image.clone();
+        apply_preview_color(&mut grey, PreviewColor { monochrome: false, black: true, white: true, threshold: 0.5, alpha_threshold: 0.5 });
+        assert!(grey.pixels().all(|p| p[0] == p[1] && p[1] == p[2]));
+        apply_preview_color(&mut image, PreviewColor { monochrome: true, black: true, white: false, threshold: 0.5, alpha_threshold: 0.5 });
+        assert_eq!(image.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(1, 0)[3], 0);
     }
 
     #[test]
